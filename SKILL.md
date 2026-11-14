@@ -1,5 +1,5 @@
 ---
-name: sec-credit-analysis
+name: automated-loan-review
 description: >
   Generate a bank-grade credit memo for any US public company using SEC EDGAR filings.
   Use when user mentions credit analysis, credit memo, financial analysis, SEC data,
