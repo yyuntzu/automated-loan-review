@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+from decimal import Decimal
 
 
 class ReviewCloud:
@@ -25,6 +27,10 @@ class ReviewCloud:
             raise ValueError('Invalid BigQuery project/dataset')
         self.client = client or bigquery.Client(project=self.project)
         self.bq = bigquery
+        self._cf01_sql = None
+        self._formula_sql = None
+        # The user approved the existing permissions and retention only for this dataset.
+        self._cf01_publication_enabled = (self.project, self.dataset) == ('focus-heuristic-438521-v4', 'sec_raw')
 
     def ensure(self):
         dataset = self.bq.Dataset(f'{self.project}.{self.dataset}')
@@ -100,7 +106,40 @@ class ReviewCloud:
                 or acceptance.get('technical_validation_passed') is not True
                 or acceptance.get('rendered_validation_passed') is not True):
             raise ValueError('Cloud publication requires independently verified final acceptance')
+        # Do not trust a caller-supplied version/value as proof of dbt execution.
+        for fact in report.facts.values():
+            if fact.formula_id == 'CF-01' and fact.formula_version == 'cf01-dbt-4dp-half-even-v1':
+                if not self._cf01_publication_enabled:
+                    raise ValueError('dbt CF-01 cloud publication is disabled pending data-governance confirmation')
+                assets, liabilities = (report.facts[i] for i in fact.input_ids)
+                checked = self.calculate_cf01({'fact_id': fact.id, 'assets': str(assets.value),
+                                               'liabilities': str(liabilities.value)})
+                if (checked.get('status') != 'calculated' or checked.get('fact_id') != fact.id
+                        or Decimal(checked['assets_cast']) != assets.value
+                        or Decimal(checked['liabilities_cast']) != liabilities.value
+                        or Decimal(checked['value']) != fact.value):
+                    raise ValueError('Cloud publication blocked: dbt CF-01 recheck failed')
+            elif (fact.formula_id in ('CF-02', 'CF-03', 'CF-04', 'CF-09', 'CF-16',
+                                      'DER-01', 'DER-02', 'DER-03', 'DER-04', 'DER-05', 'DER-06') and
+                  fact.formula_version == fact.formula_id.lower().replace('-', '') +
+                  ('-dbt-exact-v1' if fact.formula_id.startswith('DER-') else '-dbt-4dp-half-even-v1')):
+                if not self._cf01_publication_enabled:
+                    raise ValueError('dbt formula cloud publication is disabled pending data-governance confirmation')
+                inputs = [report.facts[i] for i in fact.input_ids]
+                checked = self.calculate_formula(dict(fact_id=fact.id, formula_id=fact.formula_id,
+                                                       input_values=[str(f.value) for f in inputs]))
+                if (checked.get('status') != 'calculated' or checked.get('fact_id') != fact.id
+                        or checked.get('formula_id') != fact.formula_id
+                        or len(checked.get('input_values', [])) != len(inputs)
+                        or any(Decimal(v) != i.value for v, i in zip(checked['input_values'], inputs))
+                        or Decimal(checked['value']) != fact.value):
+                    raise ValueError('Cloud publication blocked: dbt formula recheck failed')
         records = [('report', 'report', payload), ('acceptance', 'acceptance', acceptance)]
+        try:
+            from .review_outputs import calculation_metadata
+        except ImportError:
+            from review_outputs import calculation_metadata
+        records.extend(('formula_metadata', row['fact_id'], row) for row in calculation_metadata(report, run_id))
         try:
             from .formal_commentary import commentary_payload
         except ImportError:
@@ -116,6 +155,129 @@ class ReviewCloud:
 
     def record_run(self, run_id, entity, manifest):
         self.write('raw_review_runs', run_id, entity, [('run', 'manifest', manifest)])
+
+    def calculate_cf01(self, request):
+        """Compile the ephemeral dbt model, then query with bound parameters.
+
+        No calculation requests or new tables are persisted by this adapter.
+        A compile/query error propagates and cannot trigger a Python fallback.
+        """
+        if self._cf01_sql is None:
+            project = Path(os.environ.get('DBT_PROJECT_DIR', Path(__file__).resolve().parents[1] / 'references/dbt')).resolve()
+            executable = os.environ.get('DBT_EXECUTABLE', 'dbt')
+            sibling = Path(sys.executable).with_name('dbt')
+            if os.environ.get('DBT_PYTHON'):
+                prefix = [os.environ['DBT_PYTHON'], executable]
+            elif not os.environ.get('DBT_EXECUTABLE') and sibling.is_file():
+                with sibling.open('rb') as script:
+                    header = script.readline(256)
+                prefix = [sys.executable, str(sibling)] if header.startswith(b'#!') and b'python' in header else [str(sibling)]
+            else:
+                prefix = [executable]
+            with tempfile.TemporaryDirectory(prefix='cf01-dbt-') as tmp:
+                env = {**os.environ, 'GCP_PROJECT_ID': self.project, 'BQ_DATASET_ID': self.dataset}
+                cmd = [*prefix, '--warn-error', 'compile', '--select', 'cf01_parameterized',
+                       '--project-dir', str(project), '--profiles-dir', os.environ.get('DBT_PROFILES_DIR', str(project)),
+                       '--target', os.environ.get('DBT_TARGET', 'prod'), '--target-path', tmp + '/target',
+                       '--log-path', tmp + '/logs']
+                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+                if completed.returncode:
+                    raise RuntimeError('dbt CF-01 compile failed: ' + completed.stderr[-1000:] + completed.stdout[-1000:])
+                paths = list((Path(tmp) / 'target' / 'compiled').rglob('cf01_parameterized.sql'))
+                if len(paths) != 1:
+                    raise RuntimeError('dbt CF-01 compiled model missing or ambiguous')
+                self._cf01_sql = paths[0].read_text(encoding='utf-8')
+        params = [self.bq.ScalarQueryParameter(key, 'STRING', request[key])
+                  for key in ('fact_id', 'assets', 'liabilities')]
+        config = self.bq.QueryJobConfig(query_parameters=params)
+        job = self.client.query(self._cf01_sql, job_config=config,
+                                location=os.environ.get('BQ_LOCATION', 'US'))
+        rows = list(job.result())
+        if len(rows) != 1 or rows[0]['fact_id'] != request['fact_id']:
+            raise ValueError('dbt CF-01 response missing, duplicated or for another fact')
+        row = rows[0]
+        if row['assets_cast'] is None or row['liabilities_cast'] is None or row['value'] is None or row['raw_value'] is None:
+            return {'status': 'unavailable', 'reason': 'dbt CF-01 numeric conversion, division or range failure'}
+        if (Decimal(row['assets_cast']) != Decimal(request['assets'])
+                or Decimal(row['liabilities_cast']) != Decimal(request['liabilities'])):
+            raise ValueError('dbt CF-01 rejected lossy BIGNUMERIC input conversion')
+        return {'status': 'calculated', 'fact_id': row['fact_id'], 'assets_cast': row['assets_cast'],
+                'liabilities_cast': row['liabilities_cast'], 'value': row['value'],
+                'raw_value': row['raw_value'], 'job_id': job.job_id,
+                'sql_sha256': hashlib.sha256(self._cf01_sql.encode('utf-8')).hexdigest()}
+
+    def _compile_formula_model(self):
+        if self._formula_sql is None:
+            project = Path(os.environ.get('DBT_PROJECT_DIR', Path(__file__).resolve().parents[1] / 'references/dbt')).resolve()
+            executable = os.environ.get('DBT_EXECUTABLE', 'dbt')
+            sibling = Path(sys.executable).with_name('dbt')
+            if os.environ.get('DBT_PYTHON'):
+                prefix = [os.environ['DBT_PYTHON'], executable]
+            elif not os.environ.get('DBT_EXECUTABLE') and sibling.is_file():
+                with sibling.open('rb') as script:
+                    header = script.readline(256)
+                prefix = [sys.executable, str(sibling)] if header.startswith(b'#!') and b'python' in header else [str(sibling)]
+            else:
+                prefix = [executable]
+            with tempfile.TemporaryDirectory(prefix='formula-dbt-') as tmp:
+                env = {**os.environ, 'GCP_PROJECT_ID': self.project, 'BQ_DATASET_ID': self.dataset}
+                cmd = [*prefix, '--warn-error', 'compile', '--select', 'approved_formula_parameterized',
+                       '--project-dir', str(project), '--profiles-dir', os.environ.get('DBT_PROFILES_DIR', str(project)),
+                       '--target', os.environ.get('DBT_TARGET', 'prod'), '--target-path', tmp + '/target',
+                       '--log-path', tmp + '/logs']
+                completed = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+                if completed.returncode:
+                    raise RuntimeError('dbt formula compile failed: ' + completed.stderr[-1000:] + completed.stdout[-1000:])
+                paths = list((Path(tmp) / 'target' / 'compiled').rglob('approved_formula_parameterized.sql'))
+                if len(paths) != 1:
+                    raise RuntimeError('dbt formula compiled model missing or ambiguous')
+                self._formula_sql = paths[0].read_text(encoding='utf-8')
+
+    def calculate_formula(self, request):
+        """Execute one whitelisted dbt formula with exact, bound source inputs."""
+        lengths = {'CF-02': 2, 'CF-03': 2, 'CF-04': 3, 'CF-09': 2, 'CF-16': 2,
+                   'DER-01': 2, 'DER-02': 2, 'DER-03': 2, 'DER-04': 2, 'DER-05': 2, 'DER-06': 2}
+        formula = request['formula_id']
+        values = request['input_values']
+        if formula not in lengths or not isinstance(values, list) or len(values) != lengths[formula]:
+            raise ValueError('Unsupported formula or input count')
+        self._compile_formula_model()
+        fields = {'fact_id': request['fact_id'], 'formula_id': formula, 'a': values[0],
+                  'b': values[1], 'c': values[2] if len(values) == 3 else None}
+        config = self.bq.QueryJobConfig(query_parameters=[self.bq.ScalarQueryParameter(k, 'STRING', v) for k, v in fields.items()])
+        job = self.client.query(self._formula_sql, job_config=config, location=os.environ.get('BQ_LOCATION', 'US'))
+        rows = list(job.result())
+        if len(rows) != 1 or rows[0]['fact_id'] != request['fact_id'] or rows[0]['formula_id'] != formula:
+            raise ValueError('dbt formula response missing, duplicated or for another fact')
+        row = rows[0]
+        converted = [row['a_cast'], row['b_cast']] + ([row['c_cast']] if len(values) == 3 else [])
+        if any(v is None for v in converted) or row['raw_value'] is None or row['value'] is None:
+            raise ValueError('dbt formula numeric conversion, division or range failure')
+        if any(Decimal(actual) != Decimal(original) for actual, original in zip(converted, values)):
+            raise ValueError('dbt formula rejected lossy BIGNUMERIC input conversion')
+        return dict(status='calculated', fact_id=row['fact_id'], formula_id=formula, input_values=converted,
+                    raw_value=row['raw_value'], value=row['value'], job_id=job.job_id,
+                    sql_sha256=hashlib.sha256(self._formula_sql.encode('utf-8')).hexdigest())
+
+    def verify_shadow_evidence(self, observation):
+        """Verify the prior comparison against the actual BigQuery query job."""
+        trace = observation['trace']
+        self._compile_formula_model()
+        digest = hashlib.sha256(self._formula_sql.encode('utf-8')).hexdigest()
+        if trace.get('sql_sha256') != digest:
+            raise ValueError('shadow SQL does not match the current formula model')
+        locator = observation['calculation_locator']
+        job = self.client.get_job(locator.removeprefix('bigquery-job:'), location=os.environ.get('BQ_LOCATION', 'US'))
+        if (job.project != self.project or job.state != 'DONE' or job.error_result
+                or getattr(job, 'job_type', None) != 'query'
+                or hashlib.sha256(job.query.encode('utf-8')).hexdigest() != digest):
+            raise ValueError('shadow BigQuery job is invalid or does not match the formula model')
+        parameters = {p.name: p.value for p in job.query_parameters}
+        values = trace['input_values']
+        expected = {'fact_id': observation['fact_id'], 'formula_id': trace['formula_id'],
+                    'a': values[0], 'b': values[1], 'c': values[2] if len(values) == 3 else None}
+        if parameters != expected:
+            raise ValueError('shadow BigQuery job parameters do not match the receipt')
 
     def dbt(self, stage):
         project = Path(os.environ.get('DBT_PROJECT_DIR', Path(__file__).resolve().parents[1] / 'references/dbt')).resolve()

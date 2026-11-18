@@ -23,6 +23,28 @@ function expression(f, refs) {
   const x=f.input_ids.map(id=>refs[id]);
   if(x.some(v=>!v)) throw Error('Missing formula lineage');
   const [a,b,c,d]=x;
+  if(/^DER-0[1-6]$/.test(f.formula_id||'') &&
+     f.formula_version===f.formula_id.toLowerCase().replace('-','')+'-dbt-exact-v1') {
+    const original=f.input_ids.map(id=>Number(report.facts[id].value));
+    if(original.some(v=>!Number.isFinite(v))) throw Error('Invalid dbt identity inputs');
+    const unchanged=x.map((ref,i)=>`${ref}=${original[i]}`).join(',');
+    const result=f.formula_id==='DER-05'?`(${a}+${b})`:`(${a}-${b})`;
+    return `IF(AND(${unchanged}),${result},"來源已變更，請重跑 Loan Review")`;
+  }
+  if(['CF-01','CF-02','CF-03','CF-04','CF-09','CF-16'].includes(f.formula_id) &&
+     f.formula_version===f.formula_id.toLowerCase().replace('-','')+'-dbt-4dp-half-even-v1') {
+    // Excel uses binary floats. Guard edits and verify the original result below;
+    // changed inputs must be recalculated by the authoritative dbt workflow.
+    const q=f.formula_id==='CF-04'?`((${a}+${b})/(${b}+${c}))`:
+            f.formula_id==='CF-09'?`((${a}-${b})/${b})`:
+            f.formula_id==='CF-16'?`(${a}-${b})`:`(${a}/${b})`;
+    const scaled=`ABS(${q})*10000`, whole=`INT(${scaled})`;
+    const rounded=`SIGN(${q})*IF(${scaled}-${whole}=0.5,(${whole}+MOD(${whole},2))/10000,ROUND(ABS(${q}),4))`;
+    const original=f.input_ids.map(id=>Number(report.facts[id].value));
+    if(original.some(v=>!Number.isFinite(v))) throw Error('Invalid dbt formula original inputs');
+    const unchanged=x.map((ref,i)=>`${ref}=${original[i]}`).join(',');
+    return `IF(AND(${unchanged}),${rounded},"來源已變更，請重跑 Loan Review")`;
+  }
   switch(f.formula_id) {
     case 'CF-04': return `(${a}+${b})/(${b}+${c})`;
     case 'CF-05': return `(${a}+${b}+${c})/(${b}+${d})`;
@@ -56,7 +78,7 @@ for(const [i,f] of facts.entries()) {
  } else if(f.status==='calculated') {
   const checks=f.input_ids.map(id=>`ISNUMBER(${refs[id]})`).join(',');
   let expr=expression(f,refs);
-  const denominator=f.formula_id==='CF-04'?`(${refs[f.input_ids[1]]}+${refs[f.input_ids[2]]})`:f.formula_id==='CF-05'?`(${refs[f.input_ids[1]]}+${refs[f.input_ids[3]]})`:expr.includes('/')?refs[f.input_ids[1]]:null;
+  const denominator=f.formula_id==='CF-04'?`(${refs[f.input_ids[1]]}+${refs[f.input_ids[2]]})`:f.formula_id==='CF-05'?`(${refs[f.input_ids[1]]}+${refs[f.input_ids[3]]})`:f.formula_id==='CF-16'?null:expr.includes('/')?refs[f.input_ids[1]]:null;
   if(denominator) expr=`IF(${denominator}=0,"無法計算",${expr})`;
   cell.formulas=[[`=IF(AND(${checks}),${expr},"缺少資料")`]];
  } else cell.values=[[text(f.status==='sourced'?f.value:states[f.status])]];
@@ -64,7 +86,7 @@ for(const [i,f] of facts.entries()) {
  source.getRange(`C${row}:D${row}`).format.font.color='#0000FF';
  source.getRange(`F${row}:G${row}`).format.wrapText=true;
  source.getRange(`A${row}:G${row}`).format.rowHeight=Math.max(30,14*Math.ceil(Math.max(explanation.length/65,loc.length/75)));
- verification.push({fid:f.id,ref:refs[f.id],expected:f.value,available:['sourced','calculated'].includes(f.status),unit:f.unit,status:f.status});
+ verification.push({fid:f.id,ref:refs[f.id],expected:f.value,available:['sourced','calculated'].includes(f.status),unit:f.unit,status:f.status,formulaVersion:f.formula_version});
 }
 let evidenceRow=facts.length+6;
 source.getRangeByIndexes(evidenceRow-1,0,1,7).values=[['Evidence ID','種類','Source ID','版本','文件日期','來源位置','原始證據內容']];
@@ -120,6 +142,7 @@ wb.recalculate();
 function verify() {
  for(const v of verification) {
   const value=source.getRange(v.ref).values[0][0];
+  if((/^cf(01|02|03|04|09|16)-dbt-4dp-half-even-v1$/.test(v.formulaVersion||'') || /^der0[1-6]-dbt-exact-v1$/.test(v.formulaVersion||'')) && value!==Number(v.expected)) throw Error('Excel dbt formula exact result mismatch '+v.fid);
   if(v.available && v.unit!=='text' && (!Number.isFinite(value)||Math.abs(value-Number(v.expected))>1e-8*Math.max(1,Math.abs(Number(v.expected))))) throw Error('Excel/report mismatch '+v.fid);
   if(!v.available && typeof value==='number') throw Error('Unavailable became numeric: '+v.fid);
  }
@@ -138,6 +161,17 @@ if(target) {
  source.getRange('C'+row).values=[[0]];wb.recalculate();
  if(source.getRange(target.ref).values[0][0]!==0) throw Error('Real zero lost');
  source.getRange('C'+row).values=[[original]];wb.recalculate();verify();
+}
+// A migrated dbt result must not silently become an Excel-authoritative value
+// when an input is edited; force the user to rerun the reviewed workflow.
+for(const f of facts.filter(f=>(/^cf(01|02|03|04|09|16)-dbt-4dp-half-even-v1$/.test(f.formula_version||'') || /^der0[1-6]-dbt-exact-v1$/.test(f.formula_version||'')) && f.status==='calculated')) {
+ const input=report.facts[f.input_ids[0]];
+ if(input.status!=='sourced' || input.unit!=='money') continue;
+ const inputRow=refs[input.id].slice(1), original=source.getRange('C'+inputRow).values[0][0];
+ const scale=source.getRange('D'+inputRow).values[0][0];
+ source.getRange('C'+inputRow).values=[[original+Number(report.scale)/scale]];wb.recalculate();
+ if(source.getRange(refs[f.id]).values[0][0]!=='來源已變更，請重跑 Loan Review') throw Error('dbt formula input edit was not blocked');
+ source.getRange('C'+inputRow).values=[[original]];wb.recalculate();verify();
 }
 const scan=await wb.inspect({kind:'match',searchTerm:'#REF!|#DIV/0!|#VALUE!|#NAME\\?|#NUM!',options:{useRegex:true,maxResults:5},summary:'formula errors'});
 console.log(scan.ndjson);

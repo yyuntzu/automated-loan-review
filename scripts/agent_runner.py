@@ -1395,19 +1395,24 @@ def formal_http_review(ticker, body):
         from review_workflow import run_review
     if not isinstance(body, dict): raise ValueError('JSON object required')
     allowed = {'review_request', 'period_request', 'source_request', 'source', 'source_snapshot',
-               'supplements', 'execution', 'html', 'excel', 'source_run_id', 'commentary', 'commentary_mode', 'looker_config'}
+               'supplements', 'execution', 'html', 'excel', 'source_run_id', 'commentary', 'commentary_mode', 'looker_config', 'cf01_migration', 'formula_migrations', 'identity_review_bundle', 'promotion_receipts'}
     unknown = set(body) - allowed
     if unknown: raise ValueError('Unsupported options: ' + ', '.join(sorted(unknown)))
     requests = [body[k] for k in ('review_request', 'period_request', 'source_request') if k in body]
     if len(requests) != 1: raise ValueError('Provide exactly one review_request object with verified fiscal dates')
-    for key in ('html', 'excel'):
+    for key in ('html', 'excel', 'cf01_migration'):
         if key in body and not isinstance(body[key], bool): raise ValueError(key + ' must be boolean')
     if not isinstance(body.get('supplements', []), list): raise ValueError('supplements must be an array')
+    receipts = body.get('promotion_receipts', {})
+    if not isinstance(receipts, dict) or any(not isinstance(v, dict) for v in receipts.values()):
+        raise ValueError('HTTP promotion_receipts must contain inline receipt objects')
     return run_review(ticker, requests[0], source=body.get('source', 'snapshot' if 'source_snapshot' in body else 'sec'),
         snapshot=body.get('source_snapshot'), supplements=tuple(body.get('supplements', ())),
         execution=body.get('execution', 'local'), html=body.get('html', True), excel=body.get('excel', True),
         source_run_id=body.get('source_run_id'), commentary=body.get('commentary'),
-        commentary_mode=body.get('commentary_mode','auto'), looker_config=body.get('looker_config'))
+        commentary_mode=body.get('commentary_mode','auto'), looker_config=body.get('looker_config'),
+        cf01_migration=body.get('cf01_migration', False), formula_migrations=body.get('formula_migrations'),
+        identity_review_bundle=body.get('identity_review_bundle'), promotion_receipts=receipts)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

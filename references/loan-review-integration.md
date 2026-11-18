@@ -1,5 +1,42 @@
 # Formal Loan Review integration
 
+## CF-01 dbt migration: staged opt-in
+
+`--cf01-dbt` (or HTTP `cf01_migration: true`) selects the new CF-01 path for a
+run. It is not yet the default: the rollout remains staged pending broader
+historical coverage and verification.
+Existing runs and legacy requests retain their original calculation version.
+
+In cloud mode Python selects and verifies input Facts, then an ephemeral dbt
+model is compiled and executed by a parameterized BigQuery SELECT. The model
+does not create a table or append calculation requests to `raw_review_sources`.
+Input conversions must round-trip exactly; Python independently checks the
+BigQuery result at four decimal places using `ROUND_HALF_EVEN` before adopting
+it under formula version `cf01-dbt-4dp-half-even-v1`. Zero denominators and
+missing inputs remain unavailable; a mismatch fails the run. The existing
+acceptance and output gates remain in force, and cloud publication rechecks
+each migrated CF-01 result using the dbt model before writing results. The
+user approved existing permissions and retention for `focus-heuristic-438521-v4.sec_raw`;
+publication of migrated CF-01 facts is restricted to that project and dataset.
+The result's raw BigQuery ratio, query job ID, SQL hash and input lineage are
+retained as review evidence in the local report; publication would persist that
+evidence in the existing `raw_review_results` only after the gate is opened.
+
+In local mode with this option, CF-01 is unavailable with an explicit reason;
+Python does not compute a substitute. Directly sourced values retain their
+existing treatment. The run manifest records `cf01_engine`. The Markdown
+report describes the input values, period and source locators for the migrated
+ratio. Excel verifies the derived value and asks for a new Loan Review when a
+CF-01 input is edited: its floating-point arithmetic cannot be treated as the
+authority. Native Excel behavior has not been automatically validated.
+
+The real BigQuery integration test uses only synthetic values and runs only
+when `CF01_LIVE_TEST=1`. A check of accepted and published historical runs in
+the configured dataset returned no calculated CF-01 records; that result
+does not establish historical equivalence or coverage. A previous synthetic
+probe observed loss of `1E-39` during BIGNUMERIC conversion, so an apparently
+successful `SAFE_CAST` alone is never sufficient proof of exact conversion.
+
 The default CLI, shell and versioned `/v2` HTTP entrypoints use `review_workflow.run_review()`.
 Unversioned HTTP routes also retain the historical request shapes described below.
 Financial results are calculated once by the existing formal contract. Dashboard,
@@ -240,3 +277,29 @@ Markdown, Dashboard, Excel, and the formal BigQuery commentary view share the
 same narratives. Commentary is display-only and does not gate financial acceptance. Current MD&A
 is sufficient; missing summaries or model failures remain explicit warnings while
 numeric report delivery continues. Page-number enhancements are deferred.
+
+
+## Per-formula migration and review evidence
+
+Cloud runs can select `--dbt-formula CF-03=shadow` (repeat the option for
+individual CF-02/03/04/09/16 or DER-01..06). Shadow keeps the existing report
+calculation, saves comparisons in `formula_shadow.json`, and records its hash in
+the manifest. Each cloud `--dbt-formula CF-03=dbt` requires
+`--shadow-receipt CF-03=/path/to/prior/run_manifest.json`: the previous run must
+have at least one matching result and no mismatches for that formula, entity and
+scope. The job must still be accessible and its compiled SQL and bound inputs
+must match the receipt. Expired, unavailable, altered or mismatched evidence
+blocks promotion. A match does not prove all cases were exercised: review the
+complete shadow results and tests before enabling a formula. New runs can omit
+the flag to select the historical cloud engine; published runs are unchanged.
+HTTP uses `formula_migrations` and `promotion_receipts` objects; each receipt
+contains `manifest` and the exact `shadow_json` text, not a server file path.
+
+Selected migrated calculations are unavailable locally; no Python fallback is
+used. DER calculations additionally require an explicit `--identity-reviews`
+JSON bundle with reviewer, source definition, period and input evidence bindings.
+`identity_candidates.json` is an inventory for human review, not an approval.
+The report and `formula_metadata.json` show formula, inputs, period, source,
+result, status and version; approved cloud publication also exposes metadata
+through formal/Looker views. Final ratios use four decimal places and
+ROUND_HALF_EVEN; lossy input conversion blocks calculation.

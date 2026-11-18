@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, replace
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 import json
 import hashlib
 import csv
@@ -30,6 +30,7 @@ except ImportError:
     from debt_policy import DEBT_FIELDS, DEBT_SUM_INPUTS, VERSION as DEBT_POLICY_VERSION, supported_debt_source, reported_debt_basis
 
 FORMULA_VERSION = 'acceptance-v1.0-addendum-2026-10-23'
+CF01_DBT_VERSION = 'cf01-dbt-4dp-half-even-v1'
 
 
 
@@ -162,11 +163,43 @@ def _supporting_slots(report):
     return replace(report, facts=facts)
 
 
-def calculate_report(report, identity_reviews=()):
+def calculate_report(report, identity_reviews=(), *, cf01_backend=None, formula_backends=None, identity_backends=None):
     """Explicit existing decisions are required; reviews never become approvals."""
     report = _supporting_slots(report)
+    formula_backends = formula_backends or {}
+    identity_backends = identity_backends or {}
     for review in identity_reviews:
-        report = calculate_identity(report, **review)
+        formula = review['formula_id']
+        if formula in identity_backends:
+            expected_version = formula.lower().replace('-', '') + '-dbt-exact-v1'
+            choice = identity_backends[formula]
+            if isinstance(choice, dict):
+                if choice.get('mode') != 'shadow' or set(choice) != {'mode', 'backend', 'observations'}:
+                    raise ValueError('Invalid dbt identity shadow configuration')
+                # Validate the reviewed identity before any external calculation.
+                baseline = calculate_identity(report, **review)
+                shadow_review = {**review, 'formula_version': expected_version}
+                executor = lambda r, target, inputs, fid: _calculate_identity_external(r, target, inputs, fid, choice['backend'])
+                candidate = calculate_identity(report, **shadow_review, calculation_executor=executor)
+                before, after = baseline.facts[review['fact_id']], candidate.facts[review['fact_id']]
+                comparison = ('matched' if before.value == after.value else 'mismatch') if before.status in AVAILABLE and after.status in AVAILABLE else 'unavailable'
+                trace = json.loads(candidate.evidence[after.evidence_ids[-1]].content) if after.status in AVAILABLE else None
+                choice['observations'].append(dict(formula_id=formula, fact_id=review['fact_id'],
+                    python_status=before.status.value, dbt_status=after.status.value,
+                    python_value=str(before.value) if before.value is not None else None,
+                    dbt_value=str(after.value) if after.value is not None else None,
+                    input_ids=list(review['input_ids']), comparison=comparison, trace=trace,
+                    definition_evidence_id=review['definition_evidence_id'], reason=after.reason,
+                    formula_version=after.formula_version,
+                    calculation_locator=candidate.evidence[after.evidence_ids[-1]].locator if after.status in AVAILABLE else None))
+                report = baseline
+            else:
+                if review['formula_version'] != expected_version:
+                    raise ValueError('dbt identity requires its explicit exact formula version')
+                executor = lambda r, target, inputs, fid: _calculate_identity_external(r, target, inputs, fid, choice)
+                report = calculate_identity(report, **review, calculation_executor=executor)
+        else:
+            report = calculate_identity(report, **review)
     # The displayed basis is the approved formula, not an invented company EBITDA.
     for period in report.periods:
         role = period.role
@@ -202,6 +235,9 @@ def calculate_report(report, identity_reviews=()):
             continue
         # Source conflicts are not erased by a second calculation attempt.
         if f.status in (Status.CONFLICT, Status.NOT_APPLICABLE):
+            continue
+        if f.metric == 'current_ratio' and cf01_backend is not None:
+            report = _calculate_cf01_external(report, fid, cf01_backend)
             continue
         metrics = (f.metric, 'revenue') if common else spec.inputs
         if f.metric == 'total_debt':
@@ -240,9 +276,204 @@ def calculate_report(report, identity_reviews=()):
                     role = 'prior_interim' if role == 'current_interim' else 'prior_period_not_in_report'
             canonical = f'{metric}:{role}'
             ids.append(canonical if canonical in report.facts else f'input:{metric}:{role}')
+        if not common and spec.formula in formula_backends:
+            choice = formula_backends[spec.formula]
+            if isinstance(choice, dict):
+                if choice.get('mode') != 'shadow' or set(choice) != {'mode', 'backend', 'observations'}:
+                    raise ValueError('Invalid dbt shadow configuration')
+                candidate = _calculate_formula_external(report, fid, tuple(ids), choice['backend'])
+                report = calculate_fact(report, fid, input_ids=tuple(ids), formula_version=FORMULA_VERSION)
+                current, trial = report.facts[fid], candidate.facts[fid]
+                comparison = 'unavailable'
+                if current.status in AVAILABLE and trial.status in AVAILABLE:
+                    with localcontext() as context:
+                        context.prec = 300
+                        rounded = current.value.quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN)
+                    comparison = 'matched' if rounded == trial.value else 'mismatch'
+                trace = json.loads(candidate.evidence[trial.evidence_ids[0]].content) if trial.evidence_ids else None
+                choice['observations'].append(dict(formula_id=spec.formula, fact_id=fid,
+                    python_status=current.status.value, dbt_status=trial.status.value,
+                    python_value=str(current.value) if current.value is not None else None,
+                    dbt_value=str(trial.value) if trial.value is not None else None,
+                    input_ids=list(ids), comparison=comparison, trace=trace,
+                    reason=trial.reason, formula_version=trial.formula_version,
+                    calculation_locator=candidate.evidence[trial.evidence_ids[0]].locator if trial.evidence_ids else None))
+            else:
+                report = _calculate_formula_external(report, fid, tuple(ids), choice)
+            continue
         report = calculate_fact(report, fid, input_ids=tuple(ids),
             formula_version=DEBT_POLICY_VERSION if f.metric in DEBT_FIELDS else APPROVED_POLICY_VERSION if f.metric == "ltm_ebitda" else FORMULA_VERSION)
     return report
+
+
+MIGRATED_FORMULAS = frozenset({'CF-02', 'CF-03', 'CF-04', 'CF-09', 'CF-16'})
+MIGRATED_IDENTITIES = frozenset({'DER-01', 'DER-02', 'DER-03', 'DER-04', 'DER-05', 'DER-06'})
+
+
+def _calculate_identity_external(report, target, inputs, formula, backend):
+    if formula not in MIGRATED_IDENTITIES:
+        raise ValueError('Unsupported dbt identity')
+    if backend == 'offline':
+        return None, None
+    values = [f.value for f in inputs]
+    request = dict(fact_id=target.id, entity=report.entity, scope=report.scope,
+                   formula_id=formula, input_ids=[f.id for f in inputs], input_values=[str(v) for v in values])
+    response = backend.calculate_formula(request)
+    if (response.get('status') != 'calculated' or response.get('fact_id') != target.id
+            or response.get('formula_id') != formula):
+        raise ValueError('dbt identity returned unavailable or inconsistent result')
+    converted = response.get('input_values')
+    if not isinstance(converted, list) or len(converted) != 2 or any(Decimal(v) != x for v, x in zip(converted, values)):
+        raise ValueError('dbt identity input conversion was lossy')
+    with localcontext() as context:
+        context.prec = 300
+        expected = values[0] + values[1] if formula == 'DER-05' else values[0] - values[1]
+    value, raw = Decimal(response['value']), Decimal(response['raw_value'])
+    if not value.is_finite() or not raw.is_finite() or value != expected or raw != expected:
+        raise ValueError('dbt identity failed independent exact verification')
+    job_id, sql_sha256 = response['job_id'], response['sql_sha256']
+    if not isinstance(job_id, str) or not job_id or not re.fullmatch('[a-f0-9]{64}', sql_sha256):
+        raise ValueError('dbt identity provenance missing')
+    eid = 'calculation:' + formula.lower() + ':' + target.period_role
+    version = formula.lower().replace('-', '') + '-dbt-exact-v1'
+    evidence = Evidence(eid, report.entity, report.scope, 'dbt-bigquery-identity', version, date.today(),
+        'bigquery-job:' + job_id, 'review', (target.period_role,), json.dumps(dict(formula_id=formula,
+        raw_value=str(raw), value=str(value), input_ids=request['input_ids'], input_values=request['input_values'],
+        sql_sha256=sql_sha256), ensure_ascii=False, sort_keys=True))
+    return value, evidence
+
+
+def _calculate_formula_external(report, fact_id, ids, backend):
+    """Check eligibility and bind inputs before delegating one approved formula."""
+    target = report.facts[fact_id]
+    spec = METRICS[target.metric]
+    formula = spec.formula
+    if formula not in MIGRATED_FORMULAS:
+        raise ValueError('Unsupported dbt financial formula')
+    if backend == 'offline':
+        reason = 'Offline mode: migrated ' + formula + ' requires the dbt calculation backend'
+    elif set(spec.pending) - set(report.decisions):
+        reason = 'Unresolved definitions: ' + ', '.join(sorted(set(spec.pending) - set(report.decisions)))
+    else:
+        validate_report(report, expected_mode=report.mode)
+        inputs = [report.facts.get(i) for i in ids]
+        if any(f is None or f.status not in AVAILABLE for f in inputs):
+            reason = 'Required inputs unavailable'
+        else:
+            periods = {p.role: p for p in report.periods}
+            if tuple(f.metric for f in inputs) != spec.inputs:
+                raise ValueError('dbt formula input identity/order mismatch')
+            roles = [p.role for p in report.periods]
+            for n, item in enumerate(inputs):
+                role = target.period_role
+                if n == 1 and formula in ('CF-09', 'CF-16'):
+                    if report.mode == Mode.ANNUAL:
+                        pos = roles.index(role)
+                        role = roles[pos-1] if pos else None
+                    else:
+                        role = 'prior_interim' if role == 'current_interim' else None
+                if (role is None or item.period_role != role or item.unit != METRICS[item.metric].unit
+                        or item.entity != report.entity or item.scope != report.scope
+                        or (item.start, item.end) != _dates(item.metric, periods[role])):
+                    raise ValueError('dbt formula input scope, unit or period mismatch')
+            values = tuple(f.value for f in inputs)
+            with localcontext() as context:
+                context.prec = 300
+                interest_denominator = values[1] + values[2] if formula == 'CF-04' else None
+            if ((formula in ('CF-02', 'CF-03', 'CF-09') and values[1] == 0)
+                    or (formula == 'CF-04' and interest_denominator == 0)):
+                reason = 'Zero divisor or nonnumeric input'
+            else:
+                version = formula.lower().replace('-', '') + '-dbt-4dp-half-even-v1'
+                request = dict(fact_id=fact_id, entity=report.entity, scope=report.scope,
+                    input_ids=ids, input_values=[str(v) for v in values], period_role=target.period_role,
+                    formula_id=formula, formula_version=version)
+                response = backend.calculate_formula(request)
+                if response.get('status') != 'calculated' or response.get('fact_id') != fact_id or response.get('formula_id') != formula:
+                    raise ValueError('dbt formula returned unavailable or inconsistent result')
+                converted = response.get('input_values')
+                if not isinstance(converted, list) or len(converted) != len(values) or any(Decimal(v) != expected for v, expected in zip(converted, values)):
+                    raise ValueError('dbt formula input conversion was lossy')
+                with localcontext() as context:
+                    context.prec = 300
+                    expected = approved_formula_value(formula, values).quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN)
+                    raw = Decimal(response['raw_value'])
+                    result = Decimal(response['value'])
+                    if not raw.is_finite() or not result.is_finite() or raw.quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN) != result or result != expected:
+                        raise ValueError('dbt formula failed independent four-decimal verification')
+                job_id, sql_sha256 = response['job_id'], response['sql_sha256']
+                if not isinstance(job_id, str) or not job_id or not re.fullmatch('[a-f0-9]{64}', sql_sha256):
+                    raise ValueError('dbt formula provenance missing')
+                evidence_id = 'calculation:' + formula.lower() + ':' + target.period_role
+                evidence = Evidence(evidence_id, report.entity, report.scope, 'dbt-bigquery-formula', version,
+                    date.today(), 'bigquery-job:' + job_id, 'review', (target.period_role,),
+                    json.dumps(dict(formula_id=formula, raw_value=str(raw), value=str(result),
+                                    input_ids=ids, input_values=[str(v) for v in values], sql_sha256=sql_sha256,
+                                    rounding='ROUND_HALF_EVEN', places=4), ensure_ascii=False, sort_keys=True))
+                updated = replace(target, status=Status.CALCULATED, value=result, reason='', formula_id=formula,
+                                  formula_version=version, input_ids=ids, evidence_ids=(evidence_id,))
+                result_report = replace(report, facts={**report.facts, fact_id: updated},
+                                        evidence={**report.evidence, evidence_id: evidence})
+                validate_report(result_report, expected_mode=report.mode)
+                return result_report
+    updated = replace(target, status=Status.NOT_CALCULABLE, value=None, reason=reason)
+    return replace(report, facts={**report.facts, fact_id: updated})
+
+
+def _calculate_cf01_external(report, fact_id, backend):
+    """Adopt only a verified external CF-01 result; never use verification as fallback."""
+    target = report.facts[fact_id]
+    if backend == 'offline':
+        reason = 'Offline mode: migrated CF-01 requires the dbt calculation backend'
+    else:
+        ids = tuple((metric + ':' + target.period_role) if metric + ':' + target.period_role in report.facts
+                    else ('input:' + metric + ':' + target.period_role)
+                    for metric in ('current_assets', 'current_liabilities'))
+        values = [report.facts.get(i) for i in ids]
+        if any(f is None or f.status not in AVAILABLE for f in values):
+            reason = 'Required inputs unavailable'
+        elif values[1].value == 0:
+            reason = 'Zero divisor or nonnumeric input'
+        else:
+            a, b = (f.value for f in values)
+            request = dict(fact_id=fact_id, entity=report.entity, scope=report.scope,
+                assets=str(a), liabilities=str(b), input_ids=ids,
+                period_role=target.period_role, end=target.end.isoformat(),
+                formula_id='CF-01', formula_version=CF01_DBT_VERSION)
+            response = backend.calculate_cf01(request)
+            if response.get('status') == 'unavailable':
+                reason = response.get('reason') or 'dbt CF-01 calculation unavailable'
+            else:
+                if (response.get('status') != 'calculated' or response.get('fact_id') != fact_id
+                    or Decimal(response['assets_cast']) != a or Decimal(response['liabilities_cast']) != b):
+                    raise ValueError('dbt CF-01 returned inconsistent identity or lossy input conversion')
+                with localcontext() as context:
+                    context.prec = 300
+                    expected = (a / b).quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN)
+                    raw = Decimal(response['raw_value'])
+                    if not raw.is_finite() or raw.quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN) != Decimal(response['value']):
+                        raise ValueError('dbt CF-01 raw and rounded values disagree')
+                result = Decimal(response['value'])
+                if not result.is_finite() or result != expected:
+                    raise ValueError('dbt CF-01 failed independent four-decimal verification')
+                job_id, sql_sha256 = response['job_id'], response['sql_sha256']
+                if not isinstance(job_id, str) or not job_id or not re.fullmatch('[a-f0-9]{64}', sql_sha256):
+                    raise ValueError('dbt CF-01 calculation provenance missing')
+                evidence_id = 'calculation:cf01:' + target.period_role
+                evidence = Evidence(evidence_id, report.entity, report.scope, 'dbt-bigquery-cf01',
+                    CF01_DBT_VERSION, date.today(), 'bigquery-job:' + job_id, 'review', (target.period_role,),
+                    json.dumps(dict(raw_value=str(raw), value=str(result), assets=str(a), liabilities=str(b),
+                                    input_ids=ids, sql_sha256=sql_sha256, rounding='ROUND_HALF_EVEN', places=4),
+                               ensure_ascii=False, sort_keys=True))
+                updated = replace(target, status=Status.CALCULATED, value=result, reason='',
+                    formula_id='CF-01', formula_version=CF01_DBT_VERSION, input_ids=ids,
+                    evidence_ids=(evidence_id,))
+                updated_report = replace(report, facts={**report.facts, fact_id: updated},
+                                         evidence={**report.evidence, evidence_id: evidence})
+                validate_report(updated_report, expected_mode=report.mode)
+                return updated_report
+    updated = replace(target, status=Status.NOT_CALCULABLE, value=None, reason=reason)
+    return replace(report, facts={**report.facts, fact_id: updated})
 
 
 def _pair(report):
@@ -336,7 +567,22 @@ def validate_arithmetic(report):
                 raise ValueError('Identity formula components mismatch')
             if any((i.start, i.end, i.period_role, i.currency) != (f.start, f.end, f.period_role, f.currency) for i in items):
                 raise ValueError('Identity input period/unit mismatch')
-            expected = values[0] + sign * values[1]
+            if f.formula_version == f.formula_id.lower().replace('-', '') + '-dbt-exact-v1':
+                with localcontext() as context:
+                    context.prec = 300
+                    expected = values[0] + sign * values[1]
+            else:
+                expected = values[0] + sign * values[1]
+        elif (f.formula_id in MIGRATED_FORMULAS and
+              f.formula_version == f.formula_id.lower().replace('-', '') + '-dbt-4dp-half-even-v1'):
+            with localcontext() as context:
+                context.prec = 300
+                value = approved_formula_value(f.formula_id, values)
+                expected = value.quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN) if value is not None else None
+        elif f.formula_id == 'CF-01' and f.formula_version == CF01_DBT_VERSION:
+            with localcontext() as context:
+                context.prec = 300
+                expected = (values[0] / values[1]).quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN) if values[1] != 0 else None
         else:
             if f.formula_id == 'CASH-CHANGE-v1' and not any(report.evidence[eid].kind == 'definition' for eid in f.evidence_ids):
                 raise ValueError('Cash change requires an explicit reviewed same-basis complete bridge')
@@ -546,17 +792,92 @@ def acceptance_result(report, checks=(), limitations=()):
             'incomplete_commentary': missing_commentary, 'commentary_required_for_acceptance': False}
 
 
-def complete_report(report, inputs, candidates, *, checks=(), limitations=(), identity_reviews=()):
+def _adopt_identity_review_bundle(report, bundle, *, expected_cik, as_of, identity_modes):
+    """Adopt explicit reviewer attestations bound to this request and its inputs."""
+    try:
+        from .review_outputs import lineage_evidence_ids
+    except ImportError:
+        from review_outputs import lineage_evidence_ids
+    required = {'schema_version', 'entity', 'cik', 'scope', 'as_of', 'currency', 'scale', 'mode', 'reviews'}
+    if not isinstance(bundle, dict) or set(bundle) != required or bundle['schema_version'] != 1:
+        raise ValueError('Invalid identity review bundle schema')
+    if (not expected_cik or bundle['cik'] != expected_cik or bundle['entity'] != report.entity
+            or bundle['scope'] != report.scope or bundle['currency'] != report.currency
+            or number(bundle['scale']) != report.scale or bundle['mode'] != report.mode.value
+            or bundle['as_of'] != as_of):
+        raise ValueError('Identity review borrower, CIK, as_of, mode, currency or scale mismatch')
+    if not isinstance(bundle['reviews'], list): raise ValueError('Identity reviews must be a list')
+    evidence = dict(report.evidence)
+    reviews, seen = [], set()
+    for item in bundle['reviews']:
+        fields = {'fact_id', 'formula_id', 'input_ids', 'period_start', 'period_end', 'bindings', 'evidence', 'verification'}
+        if not isinstance(item, dict) or set(item) != fields or item['formula_id'] not in identity_modes:
+            raise ValueError('Identity review needs explicitly selected formula and exact schema')
+        target = report.facts.get(item['fact_id'])
+        if target is None or target.id in seen: raise ValueError('Unknown or duplicate identity target')
+        seen.add(target.id)
+        if (item['period_start'] != (target.start.isoformat() if target.start else None)
+                or item['period_end'] != (target.end.isoformat() if target.end else None)):
+            raise ValueError('Identity review period differs from target')
+        ids, bindings = item['input_ids'], item['bindings']
+        if not isinstance(ids, list) or len(ids) != 2 or not isinstance(bindings, list) or len(bindings) != 2:
+            raise ValueError('Identity review requires two bound source inputs')
+        for fid, binding in zip(ids, bindings):
+            if not isinstance(binding, dict) or set(binding) != {'fact_id', 'value', 'evidence_ids'}:
+                raise ValueError('Identity review input binding is invalid')
+            fact = report.facts.get(fid)
+            if (fact is None or fact.status not in AVAILABLE or binding['fact_id'] != fid
+                    or number(binding['value']) != fact.value or not isinstance(binding['evidence_ids'], list)
+                    or sorted(binding['evidence_ids']) != sorted(lineage_evidence_ids(report, fid))):
+                raise ValueError('Identity review input or evidence changed since review')
+        raw, verification = item['evidence'], item['verification']
+        if not isinstance(raw, dict) or set(raw) != {'id', 'source_id', 'version', 'document_date', 'locator', 'content'}:
+            raise ValueError('Identity definition evidence has invalid fields')
+        if any(not isinstance(raw[k], str) or not raw[k].strip() for k in raw):
+            raise ValueError('Identity definition evidence requires source, version, date, locator and content')
+        if (not isinstance(verification, dict) or set(verification) != {'verified_by', 'verified_at', 'method'}
+                or not isinstance(verification['verified_by'], str) or not verification['verified_by'].strip()
+                or verification['method'] != 'checked_against_source'):
+            raise ValueError('Identity review requires explicit source verification')
+        doc_date, verified_at = day(raw['document_date']), day(verification['verified_at'])
+        if doc_date > day(as_of) or verified_at < doc_date:
+            raise ValueError('Identity definition is after as_of or review predates source')
+        if raw['id'] in evidence: raise ValueError('Duplicate identity definition evidence ID')
+        content = json.dumps(dict(excerpt=raw['content'], fact_id=target.id, formula_id=item['formula_id'],
+            bindings=bindings, period_start=item['period_start'], period_end=item['period_end'],
+            verification=verification), ensure_ascii=False, sort_keys=True)
+        evidence[raw['id']] = Evidence(raw['id'], report.entity, report.scope, raw['source_id'], raw['version'],
+            doc_date, raw['locator'], 'definition', (target.period_role,), content)
+        mode = identity_modes[item['formula_id']]
+        reviews.append(dict(fact_id=target.id, formula_id=item['formula_id'], input_ids=tuple(ids),
+            formula_version=(FORMULA_VERSION if mode == 'shadow' else item['formula_id'].lower().replace('-', '') + '-dbt-exact-v1'),
+            definition_evidence_id=raw['id']))
+    report = replace(report, evidence=evidence)
+    validate_report(report, expected_mode=report.mode)
+    return report, tuple(reviews)
+
+
+def complete_report(report, inputs, candidates, *, checks=(), limitations=(), identity_reviews=(), cf01_backend=None, formula_backends=None, identity_backends=None,
+                    identity_review_bundle=None, expected_cik=None, as_of=None, identity_modes=None):
     report, inputs = apply_approved_policy(report, inputs, candidates)
     report = adopt_inputs(report, inputs, candidates)
-    report = calculate_report(report, identity_reviews)
+    if identity_review_bundle is not None:
+        report, reviewed = _adopt_identity_review_bundle(report, identity_review_bundle,
+            expected_cik=expected_cik, as_of=as_of, identity_modes=identity_modes or {})
+        identity_reviews = tuple(identity_reviews) + reviewed
+    report = calculate_report(report, identity_reviews, cf01_backend=cf01_backend,
+                              formula_backends=formula_backends, identity_backends=identity_backends)
     report = build_narratives(report)
     return report, acceptance_result(report, checks or automatic_reconciliation_checks(report), limitations)
 
 
-def report_from_source_bundle(bundle, *, checks=(), limitations=()):
+def report_from_source_bundle(bundle, *, checks=(), limitations=(), cf01_backend=None, formula_backends=None,
+                              identity_backends=None, identity_review_bundle=None, identity_modes=None):
     report, _, _ = parse_request(bundle['request'])
-    return complete_report(report, bundle['inputs'], bundle['evidence'], checks=checks, limitations=limitations)
+    return complete_report(report, bundle['inputs'], bundle['evidence'], checks=checks, limitations=limitations,
+                           cf01_backend=cf01_backend, formula_backends=formula_backends,
+                           identity_backends=identity_backends, identity_review_bundle=identity_review_bundle,
+                           expected_cik=bundle.get('cik'), as_of=bundle.get('as_of'), identity_modes=identity_modes)
 
 
 def write_findings(report, acceptance, directory, source_bundle=None):

@@ -1,5 +1,12 @@
 version: 2
 models:
+  - name: fct_loan_review_formula_metadata
+    columns:
+      - name: fact_id
+        tests:
+          - not_null:
+              config:
+                severity: error
   - name: fct_loan_review_commentary
     columns:
       - name: commentary_id
