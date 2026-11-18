@@ -2,10 +2,13 @@
 
 ## CF-01 dbt migration: staged opt-in
 
-`--cf01-dbt` (or HTTP `cf01_migration: true`) selects the new CF-01 path for a
-run. It is not yet the default: the rollout remains staged pending broader
-historical coverage and verification.
-Existing runs and legacy requests retain their original calculation version.
+Cloud runs now select the CF-01 dbt path by default. Use `--cf01-python` (or
+HTTP `cf01_migration: false`) for an explicit historical Python rollback run.
+Local runs retain the historical default; `--cf01-dbt` (or HTTP
+`cf01_migration: true`) selects the migration explicitly and reports it
+unavailable locally. Phase 3 formulas still require individual shadow and
+receipt selection before dbt authority. Existing published runs are unchanged;
+real-company and production rollout acceptance remains outstanding.
 
 In cloud mode Python selects and verifies input Facts, then an ephemeral dbt
 model is compiled and executed by a parameterized BigQuery SELECT. The model

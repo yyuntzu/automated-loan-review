@@ -114,13 +114,20 @@ class CF01MigrationTests(unittest.TestCase):
         cloud = SyntheticCloud()
         with tempfile.TemporaryDirectory() as tmp:
             result = run_review('SYNTHETIC-ONLY', request_fixture(), source='snapshot', snapshot=source,
-                output_dir=tmp, execution='cloud', cloud=cloud, excel=False, commentary_mode='off',
-                cf01_migration=True)
+                output_dir=tmp, execution='cloud', cloud=cloud, excel=False, commentary_mode='off')
             self.assertEqual(result['status'], 'draft', result.get('errors'))
             self.assertEqual(result['cf01_engine'], 'bigquery_dbt')
             self.assertFalse(cloud.published)
             fact = json.loads(Path(tmp, 'report.json').read_text())['facts']['current_ratio:fy_t']
             self.assertEqual(fact['value'], '0.3333')
+        with tempfile.TemporaryDirectory() as tmp:
+            rollback = run_review('SYNTHETIC-ONLY', request_fixture(), source='snapshot', snapshot=source,
+                output_dir=tmp, execution='cloud', cloud=cloud, excel=False, commentary_mode='off',
+                cf01_migration=False)
+            self.assertEqual(rollback['status'], 'draft', rollback.get('errors'))
+            self.assertEqual(rollback['cf01_engine'], 'python_legacy')
+            facts = json.loads(Path(tmp, 'report.json').read_text())['facts']
+            self.assertNotEqual(facts['current_ratio:fy_t']['formula_version'], 'cf01-dbt-4dp-half-even-v1')
 
     def test_publish_rechecks_dbt_result_before_writing(self):
         report, acceptance = accepted_fixture()

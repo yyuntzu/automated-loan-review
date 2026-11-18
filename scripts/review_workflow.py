@@ -150,10 +150,11 @@ def _read_shadow_receipt(value, formula, entity, scope):
 def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements=(),
                workbook=None, review_date=None, mode=None, quarter=None, execution='local',
                output_dir=None, html=True, excel=True, cloud=None, source_run_id=None,
-               commentary=None, commentary_mode='auto', looker_config=None, cf01_migration=False,
+               commentary=None, commentary_mode='auto', looker_config=None, cf01_migration=None,
                formula_migrations=None, identity_review_bundle=None, promotion_receipts=None):
     """Execute once; an unaccepted review is an explicit draft, not a delivery success."""
     if execution not in ('local', 'cloud'): raise ValueError('execution must be local or cloud')
+    if cf01_migration is None: cf01_migration = execution == 'cloud'
     if not isinstance(cf01_migration, bool): raise ValueError('cf01_migration must be boolean')
     if formula_migrations is None: formula_migrations = {}
     if (not isinstance(formula_migrations, dict) or set(formula_migrations) - (MIGRATED_FORMULAS | MIGRATED_IDENTITIES)
@@ -444,7 +445,9 @@ def cli(argv):
     parser.add_argument('--output-dir')
     parser.add_argument('--no-html', action='store_true')
     parser.add_argument('--no-excel', action='store_true')
-    parser.add_argument('--cf01-dbt', action='store_true', help='Select staged CF-01 dbt calculation; offline runs retain unavailable status')
+    cf01_group = parser.add_mutually_exclusive_group()
+    cf01_group.add_argument('--cf01-dbt', dest='cf01_dbt', action='store_true', default=None, help='Select CF-01 dbt calculation; offline runs retain unavailable status')
+    cf01_group.add_argument('--cf01-python', dest='cf01_dbt', action='store_false', help='Explicitly use historical Python CF-01 for this run')
     parser.add_argument('--dbt-formula', action='append', default=[], metavar='ID=MODE', help='Select formula shadow or dbt mode (repeatable)')
     parser.add_argument('--identity-reviews', help='Explicit, source-bound identity review bundle JSON')
     parser.add_argument('--shadow-receipt', action='append', default=[], metavar='ID=MANIFEST', help='Prior successful shadow manifest for a cloud dbt formula')

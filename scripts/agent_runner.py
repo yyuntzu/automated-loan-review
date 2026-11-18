@@ -1411,7 +1411,7 @@ def formal_http_review(ticker, body):
         execution=body.get('execution', 'local'), html=body.get('html', True), excel=body.get('excel', True),
         source_run_id=body.get('source_run_id'), commentary=body.get('commentary'),
         commentary_mode=body.get('commentary_mode','auto'), looker_config=body.get('looker_config'),
-        cf01_migration=body.get('cf01_migration', False), formula_migrations=body.get('formula_migrations'),
+        cf01_migration=body.get('cf01_migration'), formula_migrations=body.get('formula_migrations'),
         identity_review_bundle=body.get('identity_review_bundle'), promotion_receipts=receipts)
 
 
