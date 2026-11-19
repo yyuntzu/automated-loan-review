@@ -42,9 +42,10 @@ successful `SAFE_CAST` alone is never sufficient proof of exact conversion.
 
 The default CLI, shell and versioned `/v2` HTTP entrypoints use `review_workflow.run_review()`.
 Unversioned HTTP routes also retain the historical request shapes described below.
-Financial results are calculated once by the existing formal contract. Dashboard,
-Excel and BigQuery publication consume that same report; dbt does not recalculate
-financial ratios or infer missing facts. The old `analyze_ticker()` function remains
+Dashboard, Excel and BigQuery publication consume the same formal report.
+Selected migrated formulas are calculated by dbt in cloud mode and independently
+verified by Python; unselected formulas follow the existing contract. DER
+identities require explicit reviewed evidence and are never inferred automatically. The old `analyze_ticker()` function remains
 a low-level compatibility API. Use `run_review()` for new Python integrations.
 
 ## Run locally
