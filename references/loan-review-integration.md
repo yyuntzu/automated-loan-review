@@ -344,3 +344,32 @@ venv/bin/python scripts/agent_runner.py SYNTHETIC-ONLY \
   --execution cloud --dbt-shadow-all --commentary-mode off \
   --output-dir /tmp/loan-review-synthetic-shadow-new
 ```
+
+### Use the migration-only mode
+
+`--dbt-migrate-all` selects CF-01/02/03/04/09/16 and DER-01..06 for the
+migration. In cloud mode, CF-01 uses dbt. For each other formula, supply
+`--shadow-receipt ID=/path/to/shadow/run_manifest.json` to request adoption of
+its dbt result. The existing workflow independently verifies each receipt and
+BigQuery job before adopting results. Selected formulas without a receipt are
+explicitly unavailable and are never silently calculated by Python. DER still
+requires `--identity-reviews` with a separately reviewed definition for the
+company and period. Direct source facts retain priority.
+
+Example after reviewing the shadow comparisons:
+
+```bash
+venv/bin/python scripts/agent_runner.py PLTR \
+  --request /absolute/path/to/verified-pltr-request.json \
+  --execution cloud --dbt-migrate-all \
+  --shadow-receipt CF-03=/absolute/path/to/shadow/run_manifest.json \
+  --shadow-receipt CF-09=/absolute/path/to/shadow/run_manifest.json \
+  --output-dir /absolute/path/to/new-pltr-migration-report
+```
+
+Repeat the receipt option for each formula with a successful prior shadow;
+the same manifest can be used for multiple formulas if each has matching
+observations. For DER include its approved identity-review bundle. Local mode
+can run this option for inspection but all migrated calculations are marked
+unavailable, as it cannot run dbt/BigQuery. A draft exit code of 2 signals that
+acceptance remains incomplete and is not equivalent to successful publication.

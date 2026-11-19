@@ -31,6 +31,27 @@ class ShadowCliTests(unittest.TestCase):
                          {f: 'shadow' for f in workflow.MIGRATED_FORMULAS | workflow.MIGRATED_IDENTITIES})
 
 
+    def test_migration_preset_selects_receipts_and_marks_others_unavailable(self):
+        from unittest.mock import patch
+        from scripts import review_workflow as workflow
+        with patch.object(workflow, 'run_review', return_value={'status': 'draft', 'final_report_accepted': False}) as run, \
+             patch.object(workflow, 'load_json', return_value={}), patch('builtins.print'):
+            workflow.cli(['SYNTHETIC-ONLY', '--request', 'request.json', '--execution', 'cloud',
+                          '--dbt-migrate-all', '--shadow-receipt', 'CF-03=/tmp/shadow.json'])
+        kwargs = run.call_args.kwargs
+        self.assertTrue(kwargs['cf01_migration'])
+        self.assertEqual(kwargs['formula_migrations']['CF-03'], 'dbt')
+        self.assertEqual(kwargs['formula_migrations']['CF-02'], 'unavailable')
+        self.assertEqual(kwargs['formula_migrations']['DER-05'], 'unavailable')
+        self.assertEqual(kwargs['promotion_receipts'], {'CF-03': '/tmp/shadow.json'})
+
+    def test_unverified_formula_does_not_call_python_or_cloud(self):
+        report = calculate_report(ratio_fixture(), formula_backends={'CF-02': 'unverified'})
+        fact = report.facts['quick_ratio:fy_t']
+        self.assertIsNone(fact.value)
+        self.assertIn('successful prior shadow', fact.reason)
+
+
 class ShadowJobVerificationTests(unittest.TestCase):
     def test_valid_job_and_tampered_parameter(self):
         import hashlib
@@ -203,6 +224,27 @@ class FormulaMigrationTests(unittest.TestCase):
                 self.assertEqual(promoted['status'], 'draft', promoted.get('errors'))
                 promoted_fact = json.loads(Path(next_dir, 'report.json').read_text())['facts']['cash_flow_ratio:fy_t']
                 self.assertEqual(promoted_fact['formula_version'], 'cf03-dbt-4dp-half-even-v1')
+
+    def test_cloud_unverified_formula_remains_unavailable_in_report(self):
+        class Cloud:
+            def ensure(self): pass
+            def stage_bundle(self, run_id, entity, bundle): return bundle
+            def record_run(self, run_id, entity, manifest): pass
+            def publish(self, *args): raise AssertionError('draft cannot publish')
+            def calculate_formula(self, request): raise AssertionError('unverified formula must not run')
+        financial = extract({
+            'NetCashProvidedByUsedInOperatingActivities': {'units': {'USD': [entry(12000000)]}},
+            'LiabilitiesCurrent': {'units': {'USD': [entry(3000000, start=None)]}},
+        })
+        source = dict(schema_version=1, entity='SYNTHETIC-ONLY', cik='0000000001', financial_facts=financial)
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_review('SYNTHETIC-ONLY', request_fixture(), source='snapshot', snapshot=source,
+                execution='cloud', cloud=Cloud(), output_dir=tmp, excel=False, commentary_mode='off',
+                formula_migrations={'CF-03': 'unavailable'}, cf01_migration=False)
+            self.assertEqual(result['status'], 'draft', result.get('errors'))
+            fact = json.loads(Path(tmp, 'report.json').read_text())['facts']['cash_flow_ratio:fy_t']
+            self.assertIsNone(fact['value'])
+            self.assertIn('successful prior shadow', fact['reason'])
 
     def test_offline_migration_exposes_unavailable_business_metadata(self):
         financial = extract({

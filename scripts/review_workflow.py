@@ -158,8 +158,8 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
     if not isinstance(cf01_migration, bool): raise ValueError('cf01_migration must be boolean')
     if formula_migrations is None: formula_migrations = {}
     if (not isinstance(formula_migrations, dict) or set(formula_migrations) - (MIGRATED_FORMULAS | MIGRATED_IDENTITIES)
-            or any(mode not in ('shadow', 'dbt') for mode in formula_migrations.values())):
-        raise ValueError('formula_migrations requires supported formula IDs with shadow or dbt modes')
+            or any(mode not in ('shadow', 'dbt', 'unavailable') for mode in formula_migrations.values())):
+        raise ValueError('formula_migrations requires supported formula IDs with shadow, dbt or unavailable modes')
     if execution == 'local' and 'shadow' in formula_migrations.values():
         raise ValueError('dbt shadow requires cloud execution; local mode does not invoke BigQuery')
     if identity_review_bundle is not None and not (set(formula_migrations) & MIGRATED_IDENTITIES):
@@ -265,11 +265,11 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
         cf01_backend = (cloud if execution == 'cloud' else 'offline') if cf01_migration else None
         shadows = []
         formula_backends = {formula: ({'mode':'shadow', 'backend':cloud, 'observations':shadows}
-            if mode == 'shadow' else (cloud if execution == 'cloud' else 'offline'))
+            if mode == 'shadow' else ('unverified' if mode == 'unavailable' else (cloud if execution == 'cloud' else 'offline')))
             for formula, mode in formula_migrations.items() if formula in MIGRATED_FORMULAS}
         identity_modes = {formula: mode for formula, mode in formula_migrations.items() if formula in MIGRATED_IDENTITIES}
         identity_backends = {formula: ({'mode':'shadow', 'backend':cloud, 'observations':shadows}
-            if mode == 'shadow' else (cloud if execution == 'cloud' else 'offline'))
+            if mode == 'shadow' else ('offline' if mode == 'unavailable' else (cloud if execution == 'cloud' else 'offline')))
             for formula, mode in identity_modes.items()}
         if 'base_report' in bundle:
             report, acceptance = complete_report(restore_report(json.loads(json.dumps(bundle['base_report'], default=str))),
@@ -361,7 +361,7 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
             write_json(directory/'commentary_validation.json',dict(complete=False,error=str(exc),mode=commentary_mode,version='formal-commentary-balance-sheet-v3'))
             manifest['outputs']['commentary_validation_path']=str(directory/'commentary_validation.json')
         outputs = write_report_artifacts(report, acceptance, directory, source_bundle=bundle)
-        requested_metadata = {formula for formula, mode in formula_migrations.items() if mode == 'dbt'}
+        requested_metadata = {formula for formula, mode in formula_migrations.items() if mode in ('dbt', 'unavailable')}
         if cf01_migration: requested_metadata.add('CF-01')
         if requested_metadata:
             write_json(directory / 'formula_metadata.json', dict(run_id=run_id, entity=entity,
@@ -449,6 +449,7 @@ def cli(argv):
     cf01_group.add_argument('--cf01-dbt', dest='cf01_dbt', action='store_true', default=None, help='Select CF-01 dbt calculation; offline runs retain unavailable status')
     cf01_group.add_argument('--cf01-python', dest='cf01_dbt', action='store_false', help='Explicitly use historical Python CF-01 for this run')
     parser.add_argument('--dbt-formula', action='append', default=[], metavar='ID=MODE', help='Select formula shadow or dbt mode (repeatable)')
+    parser.add_argument('--dbt-migrate-all', action='store_true', help='Use dbt for formulas with a prior successful shadow receipt; others unavailable')
     parser.add_argument('--dbt-shadow-all', action='store_true', help='Compare all supported CF and DER formulas; DER requires reviewed evidence')
     parser.add_argument('--identity-reviews', help='Explicit, source-bound identity review bundle JSON')
     parser.add_argument('--shadow-receipt', action='append', default=[], metavar='ID=MANIFEST', help='Prior successful shadow manifest for a cloud dbt formula')
@@ -467,6 +468,14 @@ def cli(argv):
             raise ValueError('Use a unique --dbt-formula ID=shadow or ID=dbt for each formula')
         if any(len(pair) != 2 for pair in receipts) or len({p[0] for p in receipts}) != len(receipts):
             raise ValueError('Use a unique --shadow-receipt ID=MANIFEST for each promoted formula')
+        if args.dbt_migrate_all:
+            if args.dbt_shadow_all or pairs: raise ValueError('--dbt-migrate-all cannot be combined with formula selections')
+            if args.execution == 'local' and receipts: raise ValueError('Local migration does not use shadow receipts')
+            supported = MIGRATED_FORMULAS | MIGRATED_IDENTITIES
+            if set(dict(receipts)) - supported: raise ValueError('Unsupported shadow receipt formula')
+            pairs = [[f, 'dbt' if args.execution == 'local' or f in dict(receipts) else 'unavailable'] for f in sorted(supported)]
+            if args.cf01_dbt is False: raise ValueError('--dbt-migrate-all cannot use --cf01-python')
+            args.cf01_dbt = True
         result = run_review(args.ticker, load_json(args.request) if args.request else None,
             source=args.source or ('snapshot' if args.source_snapshot else 'workbook' if args.workbook else 'sec'),
             snapshot=load_json(args.source_snapshot) if args.source_snapshot else None,

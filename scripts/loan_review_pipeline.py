@@ -350,8 +350,9 @@ def _calculate_formula_external(report, fact_id, ids, backend):
     formula = spec.formula
     if formula not in MIGRATED_FORMULAS:
         raise ValueError('Unsupported dbt financial formula')
-    if backend == 'offline':
-        reason = 'Offline mode: migrated ' + formula + ' requires the dbt calculation backend'
+    if backend in ('offline', 'unverified'):
+        reason = ('Offline mode: migrated ' + formula + ' requires the dbt calculation backend'
+                  if backend == 'offline' else 'dbt migration unavailable: successful prior shadow receipt required for ' + formula)
     elif set(spec.pending) - set(report.decisions):
         reason = 'Unresolved definitions: ' + ', '.join(sorted(set(spec.pending) - set(report.decisions)))
     else:
