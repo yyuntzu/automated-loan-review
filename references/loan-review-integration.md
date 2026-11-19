@@ -1,10 +1,51 @@
 # Formal Loan Review integration
 
+## CF-01 dbt migration: staged opt-in
+
+Cloud runs now select the CF-01 dbt path by default. Use `--cf01-python` (or
+HTTP `cf01_migration: false`) for an explicit historical Python rollback run.
+Local runs retain the historical default; `--cf01-dbt` (or HTTP
+`cf01_migration: true`) selects the migration explicitly and reports it
+unavailable locally. Phase 3 formulas still require individual shadow and
+receipt selection before dbt authority. Existing published runs are unchanged;
+real-company and production rollout acceptance remains outstanding.
+
+In cloud mode Python selects and verifies input Facts, then an ephemeral dbt
+model is compiled and executed by a parameterized BigQuery SELECT. The model
+does not create a table or append calculation requests to `raw_review_sources`.
+Input conversions must round-trip exactly; Python independently checks the
+BigQuery result at four decimal places using `ROUND_HALF_EVEN` before adopting
+it under formula version `cf01-dbt-4dp-half-even-v1`. Zero denominators and
+missing inputs remain unavailable; a mismatch fails the run. The existing
+acceptance and output gates remain in force, and cloud publication rechecks
+each migrated CF-01 result using the dbt model before writing results. The
+user approved existing permissions and retention for `focus-heuristic-438521-v4.sec_raw`;
+publication of migrated CF-01 facts is restricted to that project and dataset.
+The result's raw BigQuery ratio, query job ID, SQL hash and input lineage are
+retained as review evidence in the local report; publication would persist that
+evidence in the existing `raw_review_results` only after the gate is opened.
+
+In local mode with this option, CF-01 is unavailable with an explicit reason;
+Python does not compute a substitute. Directly sourced values retain their
+existing treatment. The run manifest records `cf01_engine`. The Markdown
+report describes the input values, period and source locators for the migrated
+ratio. Excel verifies the derived value and asks for a new Loan Review when a
+CF-01 input is edited: its floating-point arithmetic cannot be treated as the
+authority. Native Excel behavior has not been automatically validated.
+
+The real BigQuery integration test uses only synthetic values and runs only
+when `CF01_LIVE_TEST=1`. A check of accepted and published historical runs in
+the configured dataset returned no calculated CF-01 records; that result
+does not establish historical equivalence or coverage. A previous synthetic
+probe observed loss of `1E-39` during BIGNUMERIC conversion, so an apparently
+successful `SAFE_CAST` alone is never sufficient proof of exact conversion.
+
 The default CLI, shell and versioned `/v2` HTTP entrypoints use `review_workflow.run_review()`.
 Unversioned HTTP routes also retain the historical request shapes described below.
-Financial results are calculated once by the existing formal contract. Dashboard,
-Excel and BigQuery publication consume that same report; dbt does not recalculate
-financial ratios or infer missing facts. The old `analyze_ticker()` function remains
+Dashboard, Excel and BigQuery publication consume the same formal report.
+Selected migrated formulas are calculated by dbt in cloud mode and independently
+verified by Python; unselected formulas follow the existing contract. DER
+identities require explicit reviewed evidence and are never inferred automatically. The old `analyze_ticker()` function remains
 a low-level compatibility API. Use `run_review()` for new Python integrations.
 
 ## Run locally
@@ -240,3 +281,107 @@ Markdown, Dashboard, Excel, and the formal BigQuery commentary view share the
 same narratives. Commentary is display-only and does not gate financial acceptance. Current MD&A
 is sufficient; missing summaries or model failures remain explicit warnings while
 numeric report delivery continues. Page-number enhancements are deferred.
+
+
+## Per-formula migration and review evidence
+
+Cloud runs can select `--dbt-formula CF-03=shadow` (repeat the option for
+individual CF-02/03/04/09/16 or DER-01..06). Shadow keeps the existing report
+calculation, saves comparisons in `formula_shadow.json`, and records its hash in
+the manifest. Each cloud `--dbt-formula CF-03=dbt` requires
+`--shadow-receipt CF-03=/path/to/prior/run_manifest.json`: the previous run must
+have at least one matching result and no mismatches for that formula, entity and
+scope. The job must still be accessible and its compiled SQL and bound inputs
+must match the receipt. Expired, unavailable, altered or mismatched evidence
+blocks promotion. A match does not prove all cases were exercised: review the
+complete shadow results and tests before enabling a formula. New runs can omit
+the flag to select the historical cloud engine; published runs are unchanged.
+HTTP uses `formula_migrations` and `promotion_receipts` objects; each receipt
+contains `manifest` and the exact `shadow_json` text, not a server file path.
+
+Selected migrated calculations are unavailable locally; no Python fallback is
+used. In the per-formula reviewed DER mode, calculations require an explicit
+`--identity-reviews` JSON bundle. The separate `--dbt-migrate-all` mode uses
+automatic DER calculation without company-specific review, as described below.
+`identity_candidates.json` is an inventory for human review, not an approval.
+The report and `formula_metadata.json` show formula, inputs, period, source,
+result, status and version; approved cloud publication also exposes metadata
+through formal/Looker views. Final ratios use four decimal places and
+ROUND_HALF_EVEN; lossy input conversion blocks calculation.
+
+### Inspect migration from VS Code
+
+From the repository terminal, run a **new** output directory with a verified
+company request:
+
+```bash
+venv/bin/python scripts/agent_runner.py CSCO \
+  --request /absolute/path/to/csco-request.json \
+  --execution cloud --dbt-shadow-all \
+  --output-dir /absolute/path/to/new-csco-shadow-run
+```
+
+`--dbt-shadow-all` selects CF-02/03/04/09/16 and DER-01..06 in shadow mode;
+CF-01 is separately dbt-authoritative by default for cloud. The execution
+stages data and records the run in the configured BigQuery dataset. A shadow
+comparison keeps Python's formal value for those selected formulas. Inspect
+`run_manifest.json`, `formula_shadow.json`, `identity_candidates.json`,
+`source_inputs.json`, `report.json`, `acceptance.json`, and any generated
+report/Excel. Results can be draft or unavailable, including when required
+source facts or definition decisions are missing. DER without explicitly
+reviewed evidence is inventoried but is not calculated. A prior successful
+shadow for each formula is required before selecting that formula as dbt
+report authority; use repeated `--dbt-formula ID=dbt --shadow-receipt ID=PATH`
+options. Use `--identity-reviews` for a source-bound DER review bundle.
+
+The following synthetic example only verifies the workflow and produces many
+unavailable metrics because its fixture contains very few source facts; it is
+not a substitute for real-company verification:
+
+```bash
+venv/bin/python scripts/agent_runner.py SYNTHETIC-ONLY \
+  --request examples/synthetic_review_request.json \
+  --source-snapshot examples/synthetic_source_snapshot.json \
+  --execution cloud --dbt-shadow-all --commentary-mode off \
+  --output-dir /tmp/loan-review-synthetic-shadow-new
+```
+
+### Use the migration-only mode
+
+`--dbt-migrate-all` selects CF-01/02/03/04/09/16 and DER-01..06 for the
+migration. In cloud mode, CF-01 uses dbt. For each CF-02/03/04/09/16 formula, supply
+`--shadow-receipt ID=/path/to/shadow/run_manifest.json` to request adoption of
+its dbt result. The existing workflow independently verifies each receipt and
+BigQuery job before adopting results. Selected CF formulas without a receipt are
+explicitly unavailable and are never silently calculated by Python. DER uses automatic dbt identity calculation without a company-specific review. Direct source facts retain priority.
+
+Example after reviewing the shadow comparisons:
+
+```bash
+venv/bin/python scripts/agent_runner.py PLTR \
+  --request /absolute/path/to/verified-pltr-request.json \
+  --execution cloud --dbt-migrate-all \
+  --shadow-receipt CF-03=/absolute/path/to/shadow/run_manifest.json \
+  --shadow-receipt CF-09=/absolute/path/to/shadow/run_manifest.json \
+  --output-dir /absolute/path/to/new-pltr-migration-report
+```
+
+Repeat the receipt option for each formula with a successful prior shadow;
+the same manifest can be used for multiple formulas if each has matching
+observations. Local mode
+can run this option for inspection but all migrated calculations are marked
+unavailable, as it cannot run dbt/BigQuery. A draft exit code of 2 signals that
+acceptance remains incomplete and is not equivalent to successful publication.
+
+
+### Automatic DER migration mode
+
+Under `--dbt-migrate-all`, DER-01..06 are automatically calculated by the
+BigQuery/dbt identity model when their ordered inputs are available and match
+the target entity, scope, period, unit and currency. Direct source facts retain
+priority; conflicting targets and circular/reverse identities are not replaced.
+This mode follows the user's decision to dispense with company-specific review
+and prior DER shadow receipts. Reports identify the calculation as automatic
+and not company-definition reviewed. Missing or incompatible inputs remain
+unavailable. Local mode does not perform a Python substitute. Phase 3 CF
+formulas retain their independent successful-shadow prerequisites.

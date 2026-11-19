@@ -1,0 +1,8 @@
+name: cf01_shadow_probe
+version: '1.0.0'
+config-version: 2
+profile: sec_credit
+model-paths: ['models']
+models:
+  cf01_shadow_probe:
+    +materialized: ephemeral

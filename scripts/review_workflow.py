@@ -10,18 +10,19 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+import hashlib
 
 try:
     from . import loan_review_contract as contract
     from .loan_review_sources import load_json, parse_request
-    from .loan_review_pipeline import complete_report, report_from_source_bundle, write_report_artifacts, FORMULA_VERSION, APPROVED_POLICY_VERSION
-    from .review_outputs import report_payload, write_dashboard
+    from .loan_review_pipeline import complete_report, report_from_source_bundle, write_report_artifacts, FORMULA_VERSION, APPROVED_POLICY_VERSION, MIGRATED_FORMULAS, MIGRATED_IDENTITIES
+    from .review_outputs import report_payload, write_dashboard, calculation_metadata, identity_candidates
     from .review_delivery import validate_looker_config, delivery_receipt
 except ImportError:
     import loan_review_contract as contract
     from loan_review_sources import load_json, parse_request
-    from loan_review_pipeline import complete_report, report_from_source_bundle, write_report_artifacts, FORMULA_VERSION, APPROVED_POLICY_VERSION
-    from review_outputs import report_payload, write_dashboard
+    from loan_review_pipeline import complete_report, report_from_source_bundle, write_report_artifacts, FORMULA_VERSION, APPROVED_POLICY_VERSION, MIGRATED_FORMULAS, MIGRATED_IDENTITIES
+    from review_outputs import report_payload, write_dashboard, calculation_metadata, identity_candidates
     from review_delivery import validate_looker_config, delivery_receipt
 
 
@@ -91,12 +92,83 @@ def write_json(path, value):
         if temporary is not None: temporary.unlink(missing_ok=True)
 
 
+def _read_shadow_receipt(value, formula, entity, scope):
+    """Validate an immutable local or inline prior shadow receipt before promotion."""
+    if isinstance(value, str):
+        manifest = load_json(value)
+        shadow_path = manifest.get('outputs', {}).get('formula_shadow_path')
+        if not shadow_path: raise ValueError('shadow receipt has no comparison artifact')
+        raw = Path(shadow_path).read_bytes()
+    elif isinstance(value, dict) and set(value) == {'manifest', 'shadow_json'}:
+        manifest = value['manifest']
+        if not isinstance(value['shadow_json'], str): raise ValueError('shadow receipt must contain exact JSON text')
+        raw = value['shadow_json'].encode('utf-8')
+    else:
+        raise ValueError('Invalid shadow receipt')
+    if not isinstance(manifest, dict) or hashlib.sha256(raw).hexdigest() != manifest.get('formula_shadow_sha256'):
+        raise ValueError('shadow receipt integrity check failed')
+    def unique_pairs(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result: raise ValueError('Duplicate key in shadow receipt')
+            result[key] = item
+        return result
+    shadow = json.loads(raw, object_pairs_hook=unique_pairs)
+    if (manifest.get('status') not in ('accepted', 'draft') or not manifest.get('finished_at')
+            or manifest.get('entity') != entity or manifest.get('scope') != scope
+            or manifest.get('formula_migrations', {}).get(formula) != 'shadow'
+            or shadow.get('run_id') != manifest.get('run_id') or shadow.get('entity') != entity):
+        raise ValueError('shadow receipt run, scope, mode or completion does not match')
+    observations = [r for r in shadow.get('results', []) if r.get('formula_id') == formula]
+    matched = [r for r in observations if r.get('comparison') == 'matched']
+    if not matched or any(r.get('comparison') == 'mismatch' for r in observations):
+        raise ValueError('shadow receipt requires at least one match and no mismatch for ' + formula)
+    expected_version = formula.lower().replace('-', '') + ('-dbt-exact-v1' if formula.startswith('DER-') else '-dbt-4dp-half-even-v1')
+    for row in matched:
+        trace = row.get('trace')
+        if (row.get('dbt_status') != 'calculated' or row.get('python_status') != 'calculated'
+                or row.get('formula_version') != expected_version or not isinstance(trace, dict)
+                or trace.get('formula_id') != formula or trace.get('input_ids') != row.get('input_ids')
+                or trace.get('value') != row.get('dbt_value')
+                or not isinstance(row.get('calculation_locator'), str)
+                or not row['calculation_locator'].startswith('bigquery-job:')):
+            raise ValueError('shadow receipt has incomplete formula evidence')
+        before, after = Decimal(row['python_value']), Decimal(row['dbt_value'])
+        if not before.is_finite() or not after.is_finite(): raise ValueError('shadow receipt has non-finite values')
+        if formula.startswith('DER-'):
+            equal = before == after
+        else:
+            from decimal import ROUND_HALF_EVEN, localcontext
+            with localcontext() as context:
+                context.prec = 300
+                equal = before.quantize(Decimal('0.0001'), rounding=ROUND_HALF_EVEN) == after
+        if not equal: raise ValueError('shadow receipt numerical comparison failed')
+    return dict(formula_id=formula, shadow_run_id=manifest['run_id'],
+                sha256=manifest['formula_shadow_sha256'], matched_count=len(matched), observations=matched)
+
+
 def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements=(),
                workbook=None, review_date=None, mode=None, quarter=None, execution='local',
                output_dir=None, html=True, excel=True, cloud=None, source_run_id=None,
-               commentary=None, commentary_mode='auto', looker_config=None):
+               commentary=None, commentary_mode='auto', looker_config=None, cf01_migration=None,
+               formula_migrations=None, identity_review_bundle=None, promotion_receipts=None):
     """Execute once; an unaccepted review is an explicit draft, not a delivery success."""
     if execution not in ('local', 'cloud'): raise ValueError('execution must be local or cloud')
+    if cf01_migration is None: cf01_migration = execution == 'cloud'
+    if not isinstance(cf01_migration, bool): raise ValueError('cf01_migration must be boolean')
+    if formula_migrations is None: formula_migrations = {}
+    if (not isinstance(formula_migrations, dict) or set(formula_migrations) - (MIGRATED_FORMULAS | MIGRATED_IDENTITIES)
+            or any(mode not in ('shadow', 'dbt', 'unavailable', 'auto') for mode in formula_migrations.values())):
+        raise ValueError('formula_migrations requires supported formula IDs with shadow, dbt or unavailable modes')
+    if execution == 'local' and 'shadow' in formula_migrations.values():
+        raise ValueError('dbt shadow requires cloud execution; local mode does not invoke BigQuery')
+    if identity_review_bundle is not None and not (set(formula_migrations) & MIGRATED_IDENTITIES):
+        raise ValueError('Explicit DER formula migration mode required for identity reviews')
+    if promotion_receipts is None: promotion_receipts = {}
+    if not isinstance(promotion_receipts, dict): raise ValueError('promotion_receipts must be an object')
+    promotions_needed = {formula for formula, mode in formula_migrations.items() if mode == 'dbt' and execution == 'cloud'}
+    if set(promotion_receipts) != promotions_needed:
+        raise ValueError('Each cloud dbt formula requires exactly one prior successful shadow receipt')
     if looker_config is None and os.environ.get('LOOKER_STUDIO_CONFIG'):
         looker_config = load_json(os.environ['LOOKER_STUDIO_CONFIG'])
     looker_config = validate_looker_config(looker_config)
@@ -130,6 +202,8 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
         started_at=datetime.now(ZoneInfo("America/Chicago")).isoformat(), final_report_accepted=False,
         pipeline_version='formal-review-integration-v1', formula_version=FORMULA_VERSION,
         policy_version=APPROVED_POLICY_VERSION, source_run_id=source_run_id,
+        cf01_engine=('bigquery_dbt' if execution == 'cloud' else 'offline_unavailable') if cf01_migration else 'python_legacy',
+        formula_migrations=formula_migrations,
         cloud_status='pending' if execution == 'cloud' else 'not_requested', outputs={}, stages={})
     def save():
         write_json(directory / 'run_manifest.json', manifest)
@@ -146,7 +220,6 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
                 except ImportError:
                     from review_cloud import ReviewCloud
                 cloud = ReviewCloud()
-        if execution == 'cloud': cloud.ensure()
         if source == 'workbook':
             try:
                 from .nexstar_workbook_review import read_workbook, build_inputs, reconciliation_checks
@@ -176,16 +249,49 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
             bundle = runner.prepare_loan_review_source_stage(entity, request, supplements, bq_loader=loader)
         else:
             bundle = runner.prepare_loan_review_source_stage(entity, request, supplements, snapshot=snapshot)
+        scope = base.scope
+        promotions = [_read_shadow_receipt(promotion_receipts[formula], formula, entity, scope)
+                      for formula in sorted(promotions_needed)]
+        for promotion in promotions:
+            for observation in promotion.pop('observations'):
+                cloud.verify_shadow_evidence(observation)
+        if promotions: manifest['formula_promotions'] = promotions
         manifest['stages']['sources'] = 'passed'
         write_json(directory / 'source_inputs.json', bundle)
         if execution == 'cloud':
+            cloud.ensure()
             bundle = cloud.stage_bundle(run_id, entity, bundle)
             manifest['stages']['cloud_sources'] = 'passed'
+        cf01_backend = (cloud if execution == 'cloud' else 'offline') if cf01_migration else None
+        shadows = []
+        formula_backends = {formula: ({'mode':'shadow', 'backend':cloud, 'observations':shadows}
+            if mode == 'shadow' else ('unverified' if mode == 'unavailable' else (cloud if execution == 'cloud' else 'offline')))
+            for formula, mode in formula_migrations.items() if formula in MIGRATED_FORMULAS}
+        identity_modes = {formula: mode for formula, mode in formula_migrations.items() if formula in MIGRATED_IDENTITIES}
+        identity_backends = {formula: ({'mode':'shadow', 'backend':cloud, 'observations':shadows}
+            if mode == 'shadow' else ({'mode':'auto', 'backend':cloud if execution == 'cloud' else 'offline'} if mode == 'auto' else ('offline' if mode == 'unavailable' else (cloud if execution == 'cloud' else 'offline'))))
+            for formula, mode in identity_modes.items()}
         if 'base_report' in bundle:
             report, acceptance = complete_report(restore_report(json.loads(json.dumps(bundle['base_report'], default=str))),
-                bundle['inputs'], bundle['evidence'], checks=bundle['checks'], limitations=bundle['limitations'])
+                bundle['inputs'], bundle['evidence'], checks=bundle['checks'], limitations=bundle['limitations'],
+                cf01_backend=cf01_backend, formula_backends=formula_backends, identity_backends=identity_backends,
+                identity_review_bundle=identity_review_bundle, identity_modes=identity_modes)
         else:
-            report, acceptance = report_from_source_bundle(bundle)
+            report, acceptance = (report_from_source_bundle(bundle, cf01_backend=cf01_backend, formula_backends=formula_backends,
+                identity_backends=identity_backends, identity_review_bundle=identity_review_bundle, identity_modes=identity_modes)
+                if cf01_migration or formula_migrations else report_from_source_bundle(bundle))
+        if 'shadow' in formula_migrations.values():
+            write_json(directory / 'formula_shadow.json', dict(run_id=run_id, entity=entity, results=shadows))
+            manifest['outputs']['formula_shadow_path'] = str(directory / 'formula_shadow.json')
+            manifest['formula_shadow_sha256'] = hashlib.sha256((directory / 'formula_shadow.json').read_bytes()).hexdigest()
+            manifest['stages']['formula_shadow'] = ('not_evaluated' if not shadows else
+                'mismatch' if any(r['comparison']=='mismatch' for r in shadows) else
+                'incomplete' if any(r['comparison']=='unavailable' for r in shadows) else 'passed')
+        selected_identities = {f for f, mode in formula_migrations.items() if f in MIGRATED_IDENTITIES and mode != 'auto'}
+        if selected_identities:
+            write_json(directory / 'identity_candidates.json', dict(run_id=run_id, entity=entity,
+                candidates=identity_candidates(report, selected_identities)))
+            manifest['outputs']['identity_candidates_path'] = str(directory / 'identity_candidates.json')
         # Latest user authorization includes Dashboard; supersede the historical exclusion.
         from dataclasses import replace
         evidence = dict(report.evidence)
@@ -255,6 +361,12 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
             write_json(directory/'commentary_validation.json',dict(complete=False,error=str(exc),mode=commentary_mode,version='formal-commentary-balance-sheet-v3'))
             manifest['outputs']['commentary_validation_path']=str(directory/'commentary_validation.json')
         outputs = write_report_artifacts(report, acceptance, directory, source_bundle=bundle)
+        requested_metadata = {formula for formula, mode in formula_migrations.items() if mode in ('dbt', 'unavailable', 'auto')}
+        if cf01_migration: requested_metadata.add('CF-01')
+        if requested_metadata:
+            write_json(directory / 'formula_metadata.json', dict(run_id=run_id, entity=entity,
+                calculations=calculation_metadata(report, run_id, requested_metadata)))
+            manifest['outputs']['formula_metadata_path'] = str(directory / 'formula_metadata.json')
         acceptance = load_json(directory / 'acceptance.json')
         manifest.update(final_report_accepted=acceptance['final_report_accepted'], acceptance_blockers=acceptance['acceptance_blockers'])
         manifest['outputs'].update({k: v for k, v in outputs.items() if k.endswith('_path')})
@@ -333,11 +445,37 @@ def cli(argv):
     parser.add_argument('--output-dir')
     parser.add_argument('--no-html', action='store_true')
     parser.add_argument('--no-excel', action='store_true')
+    cf01_group = parser.add_mutually_exclusive_group()
+    cf01_group.add_argument('--cf01-dbt', dest='cf01_dbt', action='store_true', default=None, help='Select CF-01 dbt calculation; offline runs retain unavailable status')
+    cf01_group.add_argument('--cf01-python', dest='cf01_dbt', action='store_false', help='Explicitly use historical Python CF-01 for this run')
+    parser.add_argument('--dbt-formula', action='append', default=[], metavar='ID=MODE', help='Select formula shadow or dbt mode (repeatable)')
+    parser.add_argument('--dbt-migrate-all', action='store_true', help='Use dbt for formulas with a prior successful shadow receipt; others unavailable')
+    parser.add_argument('--dbt-shadow-all', action='store_true', help='Compare all supported CF and DER formulas; DER requires reviewed evidence')
+    parser.add_argument('--identity-reviews', help='Explicit, source-bound identity review bundle JSON')
+    parser.add_argument('--shadow-receipt', action='append', default=[], metavar='ID=MANIFEST', help='Prior successful shadow manifest for a cloud dbt formula')
     parser.add_argument('--commentary', help='JSON documents/claims bundle; offline unless model mode is selected')
     parser.add_argument('--commentary-mode', choices=('auto','model','reviewed','off'), default='auto')
     parser.add_argument('--looker-config', help='Looker Studio URL/parameter configuration JSON (or LOOKER_STUDIO_CONFIG)')
     args = parser.parse_args(argv)
     try:
+        pairs = [item.split('=', 1) for item in args.dbt_formula]
+        receipts = [item.split('=', 1) for item in args.shadow_receipt]
+        if args.dbt_shadow_all:
+            if args.execution != 'cloud': raise ValueError('--dbt-shadow-all requires --execution cloud')
+            if pairs: raise ValueError('--dbt-shadow-all cannot be combined with --dbt-formula')
+            pairs = [[formula, 'shadow'] for formula in sorted(MIGRATED_FORMULAS | MIGRATED_IDENTITIES)]
+        if any(len(pair) != 2 for pair in pairs) or len({p[0] for p in pairs}) != len(pairs):
+            raise ValueError('Use a unique --dbt-formula ID=shadow or ID=dbt for each formula')
+        if any(len(pair) != 2 for pair in receipts) or len({p[0] for p in receipts}) != len(receipts):
+            raise ValueError('Use a unique --shadow-receipt ID=MANIFEST for each promoted formula')
+        if args.dbt_migrate_all:
+            if args.dbt_shadow_all or pairs: raise ValueError('--dbt-migrate-all cannot be combined with formula selections')
+            if args.execution == 'local' and receipts: raise ValueError('Local migration does not use shadow receipts')
+            supported = MIGRATED_FORMULAS | MIGRATED_IDENTITIES
+            if set(dict(receipts)) - supported: raise ValueError('Unsupported shadow receipt formula')
+            pairs = [[f, 'auto' if f in MIGRATED_IDENTITIES else ('dbt' if args.execution == 'local' or f in dict(receipts) else 'unavailable')] for f in sorted(supported)]
+            if args.cf01_dbt is False: raise ValueError('--dbt-migrate-all cannot use --cf01-python')
+            args.cf01_dbt = True
         result = run_review(args.ticker, load_json(args.request) if args.request else None,
             source=args.source or ('snapshot' if args.source_snapshot else 'workbook' if args.workbook else 'sec'),
             snapshot=load_json(args.source_snapshot) if args.source_snapshot else None,
@@ -345,7 +483,9 @@ def cli(argv):
             review_date=args.review_date, mode=args.mode, quarter=args.quarter,
             execution=args.execution, output_dir=args.output_dir, html=not args.no_html, excel=not args.no_excel,
             source_run_id=args.source_run_id, commentary=load_json(args.commentary) if args.commentary else None,
-            commentary_mode=args.commentary_mode,
+            commentary_mode=args.commentary_mode, cf01_migration=args.cf01_dbt, formula_migrations=dict(pairs),
+            identity_review_bundle=load_json(args.identity_reviews) if args.identity_reviews else None,
+            promotion_receipts=dict(receipts),
             looker_config=load_json(args.looker_config) if args.looker_config else None)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))

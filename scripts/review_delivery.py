@@ -38,7 +38,7 @@ def delivery_receipt(manifest, config=None):
     config = validate_looker_config(config)
     outputs = manifest.get('outputs', {})
     local = {key: outputs[key] for key in (
-        'report_path', 'report_data_path', 'excel_path', 'dashboard_path', 'acceptance_path'
+        'report_path', 'report_data_path', 'excel_path', 'dashboard_path', 'acceptance_path', 'formula_metadata_path'
     ) if key in outputs}
     remote = {'status': 'not_configured', 'url': None, 'render_verified': False}
     if config is not None:

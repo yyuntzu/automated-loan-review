@@ -750,6 +750,7 @@ def render_loan_review(report, acceptance) -> str:
             ('Unresolved definitions:', '定義待確認：'),
             ('source candidate retained in audit', '原始候選值保留於來源清單'),
             ('Required inputs unavailable', '必要輸入尚未取得或尚未核實'),
+            ('Offline mode: migrated CF-01 requires the dbt calculation backend', '本機離線模式不提供已遷移的流動比率；需要 dbt 雲端計算'),
             ('Required formula inputs/definitions not yet verified', '公式必要輸入／定義尚未核實'),
             ('Reviewed same-basis cash reconciliation required; no automatic cash bridge', '須先核實相同現金口徑與完整調節，不自動反推'),
             ('No matching source in the reviewed inputs; not a claim of non-disclosure', '所選來源尚無相符資料；不代表整份申報未揭露'),
@@ -797,6 +798,48 @@ def render_loan_review(report, acceptance) -> str:
         reasons = list(dict.fromkeys(f.reason for f in unavailable))
         if reasons:
             lines += ['> 本表限制：' + esc(human_reason('；'.join(reasons))), '']
+        if matching.spec.key == 'ratios':
+            for role in matching.spec.columns:
+                fact = report.facts.get('current_ratio:' + role)
+                if not fact or fact.formula_version != 'cf01-dbt-4dp-half-even-v1' or fact.status not in AVAILABLE:
+                    continue
+                assets, liabilities = (report.facts[i] for i in fact.input_ids)
+                locators = list(dict.fromkeys(report.evidence[eid].locator
+                    for item in (assets, liabilities) for eid in item.evidence_ids))
+                lines += [f'> 流動比率計算（{esc(periods[role].label)}）：流動資產 ÷ 流動負債 = '
+                          f'{esc(assets.value)} ÷ {esc(liabilities.value)} = {esc(fact.value)}；'
+                          f'金額單位：{esc(report.currency)}，scale={esc(report.scale)}；'
+                          f'公式：CF-01，版本：{esc(fact.formula_version)}。',
+                          '> 來源：' + esc('；'.join(locators)), '']
+        if __package__:
+            from .review_outputs import FORMULA_METADATA
+        else:
+            from review_outputs import FORMULA_METADATA
+        descriptions = {fid: ('ratios' if fid in ('CF-02', 'CF-03', 'CF-04') else 'income', info[2])
+                        for fid, info in FORMULA_METADATA.items() if fid != 'CF-01'}
+        def source_locators(fid, seen=None):
+            seen = set() if seen is None else seen
+            if fid in seen: return []
+            seen.add(fid)
+            item = report.facts[fid]
+            direct = [report.evidence[eid].locator for eid in item.evidence_ids if report.evidence[eid].kind == 'fact']
+            return direct + [locator for child in item.input_ids for locator in source_locators(child, seen)]
+        for fact in report.facts.values():
+            if (fact.formula_id not in descriptions or descriptions[fact.formula_id][0] != matching.spec.key
+                    or fact.formula_version != fact.formula_id.lower().replace('-', '') +
+                       ('-dbt-exact-v1' if fact.formula_id.startswith('DER-') else '-dbt-4dp-half-even-v1')
+                    or fact.status not in AVAILABLE):
+                continue
+            parts = [f'{METRICS[report.facts[i].metric].label}（{periods[report.facts[i].period_role].label}）={report.facts[i].value}'
+                     for i in fact.input_ids]
+            locators = list(dict.fromkeys(locator for i in fact.input_ids for locator in source_locators(i)))
+            locators += [report.evidence[eid].locator for eid in fact.evidence_ids if report.evidence[eid].kind == 'definition']
+            if any(eid.startswith('policy:auto-identity:') for eid in fact.evidence_ids):
+                lines += ['> 注意：此 DER 為自動推導，尚未審核該公司財報定義及範圍。', '']
+            lines += [f'> {esc(METRICS[fact.metric].label)}（{esc(periods[fact.period_role].label)}）：'
+                      f'{esc(descriptions[fact.formula_id][1])}；輸入：{esc("；".join(parts))}；'
+                      f'結果：{esc(fact.value)}（{esc(fact.unit)}）；公式：{esc(fact.formula_id)}，版本：{esc(fact.formula_version)}。',
+                      '> 來源：' + esc('；'.join(locators) if locators else '參見來源證據'), '']
         if matching.spec.key == 'leverage':
             for role in matching.spec.columns:
                 debt = report.facts.get('total_debt:' + role)

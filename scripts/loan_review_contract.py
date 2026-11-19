@@ -412,7 +412,7 @@ def calculate_fact(report: Report, fact_id: str, *, input_ids: tuple[str, ...],
 
 def calculate_identity(report: Report, fact_id: str, *, formula_id: str,
                        input_ids: tuple[str, ...], formula_version: str,
-                       definition_evidence_id: str) -> Report:
+                       definition_evidence_id: str, calculation_executor=None) -> Report:
     """DER-01..06 only after a reviewed, complete same-scope identity is supplied.
 
     The definition evidence documents included/excluded bridge items (including
@@ -431,6 +431,9 @@ def calculate_identity(report: Report, fact_id: str, *, formula_id: str,
     metric, expected, sign = rules[formula_id]
     target = report.facts[fact_id]
     _require(target.metric == metric and target.status not in AVAILABLE, "DATA-01", "Identity target mismatch or available source")
+    if calculation_executor is not None:
+        _require(target.status not in (Status.CONFLICT, Status.NOT_APPLICABLE), 'DATA-03',
+                 'dbt identity cannot replace a conflict or confirmed inapplicability')
     _require(_text(formula_version), "CALC-02", "Explicit formula version required")
     evidence = report.evidence.get(definition_evidence_id)
     _require(evidence is not None and evidence.kind == "definition" and target.period_role in evidence.period_roles,
@@ -451,6 +454,17 @@ def calculate_identity(report: Report, fact_id: str, *, formula_id: str,
     _require(not any(depends_on(i.id, target.metric) for i in items), "CALC-02", "Circular/reverse identity")
     if any(i.status not in AVAILABLE or not _number(i.value) for i in items):
         updated = replace(target, status=Status.NOT_CALCULABLE, reason="Identity inputs unavailable")
+    elif calculation_executor is not None:
+        value, calculation_evidence = calculation_executor(report, target, items, formula_id)
+        if value is None:
+            updated = replace(target, status=Status.NOT_CALCULABLE, value=None,
+                              reason='Offline mode: migrated identity requires the dbt calculation backend')
+        else:
+            _require(calculation_evidence is not None, 'EVD-01', 'Identity calculation evidence required')
+            report = replace(report, evidence={**report.evidence, calculation_evidence.id: calculation_evidence})
+            updated = replace(target, status=Status.CALCULATED, value=value, reason='', formula_id=formula_id,
+                              formula_version=formula_version, input_ids=input_ids,
+                              evidence_ids=(definition_evidence_id, calculation_evidence.id))
     else:
         updated = replace(target, status=Status.CALCULATED, value=items[0].value + sign * items[1].value,
                           reason="", formula_id=formula_id, formula_version=formula_version,

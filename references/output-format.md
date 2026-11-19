@@ -257,3 +257,15 @@ limits above remain unchanged; numeric recomputation and rendered-table checks a
 separate functions. Unresolved inputs/decisions and incomplete reconciliation still
 block substantive acceptance. The source-only path remains source-only. Existing
 legacy report calls must not be confused with the strict renderer or final acceptance.
+
+
+### Migrated formula traceability
+
+`formula_metadata.json` describes each selected migrated calculation with its
+formula and version, input facts and periods, source evidence, result and status.
+The Loan Review narrative displays the same business-facing calculation details
+when a dbt result is adopted. `formula_shadow.json` is a separate comparison
+artifact and does not replace report values; its hash and promotion provenance
+are recorded in the run manifest. `identity_candidates.json` identifies potential
+DER reviews and never grants approval. Offline migrated values are explicitly
+unavailable. Published metadata views include accepted runs only.
