@@ -306,3 +306,40 @@ The report and `formula_metadata.json` show formula, inputs, period, source,
 result, status and version; approved cloud publication also exposes metadata
 through formal/Looker views. Final ratios use four decimal places and
 ROUND_HALF_EVEN; lossy input conversion blocks calculation.
+
+### Inspect migration from VS Code
+
+From the repository terminal, run a **new** output directory with a verified
+company request:
+
+```bash
+venv/bin/python scripts/agent_runner.py CSCO \
+  --request /absolute/path/to/csco-request.json \
+  --execution cloud --dbt-shadow-all \
+  --output-dir /absolute/path/to/new-csco-shadow-run
+```
+
+`--dbt-shadow-all` selects CF-02/03/04/09/16 and DER-01..06 in shadow mode;
+CF-01 is separately dbt-authoritative by default for cloud. The execution
+stages data and records the run in the configured BigQuery dataset. A shadow
+comparison keeps Python's formal value for those selected formulas. Inspect
+`run_manifest.json`, `formula_shadow.json`, `identity_candidates.json`,
+`source_inputs.json`, `report.json`, `acceptance.json`, and any generated
+report/Excel. Results can be draft or unavailable, including when required
+source facts or definition decisions are missing. DER without explicitly
+reviewed evidence is inventoried but is not calculated. A prior successful
+shadow for each formula is required before selecting that formula as dbt
+report authority; use repeated `--dbt-formula ID=dbt --shadow-receipt ID=PATH`
+options. Use `--identity-reviews` for a source-bound DER review bundle.
+
+The following synthetic example only verifies the workflow and produces many
+unavailable metrics because its fixture contains very few source facts; it is
+not a substitute for real-company verification:
+
+```bash
+venv/bin/python scripts/agent_runner.py SYNTHETIC-ONLY \
+  --request examples/synthetic_review_request.json \
+  --source-snapshot examples/synthetic_source_snapshot.json \
+  --execution cloud --dbt-shadow-all --commentary-mode off \
+  --output-dir /tmp/loan-review-synthetic-shadow-new
+```

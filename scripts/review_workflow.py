@@ -449,6 +449,7 @@ def cli(argv):
     cf01_group.add_argument('--cf01-dbt', dest='cf01_dbt', action='store_true', default=None, help='Select CF-01 dbt calculation; offline runs retain unavailable status')
     cf01_group.add_argument('--cf01-python', dest='cf01_dbt', action='store_false', help='Explicitly use historical Python CF-01 for this run')
     parser.add_argument('--dbt-formula', action='append', default=[], metavar='ID=MODE', help='Select formula shadow or dbt mode (repeatable)')
+    parser.add_argument('--dbt-shadow-all', action='store_true', help='Compare all supported CF and DER formulas; DER requires reviewed evidence')
     parser.add_argument('--identity-reviews', help='Explicit, source-bound identity review bundle JSON')
     parser.add_argument('--shadow-receipt', action='append', default=[], metavar='ID=MANIFEST', help='Prior successful shadow manifest for a cloud dbt formula')
     parser.add_argument('--commentary', help='JSON documents/claims bundle; offline unless model mode is selected')
@@ -458,6 +459,10 @@ def cli(argv):
     try:
         pairs = [item.split('=', 1) for item in args.dbt_formula]
         receipts = [item.split('=', 1) for item in args.shadow_receipt]
+        if args.dbt_shadow_all:
+            if args.execution != 'cloud': raise ValueError('--dbt-shadow-all requires --execution cloud')
+            if pairs: raise ValueError('--dbt-shadow-all cannot be combined with --dbt-formula')
+            pairs = [[formula, 'shadow'] for formula in sorted(MIGRATED_FORMULAS | MIGRATED_IDENTITIES)]
         if any(len(pair) != 2 for pair in pairs) or len({p[0] for p in pairs}) != len(pairs):
             raise ValueError('Use a unique --dbt-formula ID=shadow or ID=dbt for each formula')
         if any(len(pair) != 2 for pair in receipts) or len({p[0] for p in receipts}) != len(receipts):

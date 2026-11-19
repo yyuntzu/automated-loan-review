@@ -19,6 +19,18 @@ from test_loan_review_sources import entry, extract, request_fixture, rows_of
 from test_loan_review_contract import complete_fixture, fixture, source_fact
 
 
+class ShadowCliTests(unittest.TestCase):
+    def test_shadow_all_selects_every_formula(self):
+        from unittest.mock import patch
+        from scripts import review_workflow as workflow
+        with patch.object(workflow, 'run_review', return_value={'status': 'draft', 'final_report_accepted': False}) as run, \
+             patch.object(workflow, 'load_json', return_value={}), \
+             patch('builtins.print'):
+            workflow.cli(['SYNTHETIC-ONLY', '--request', 'request.json', '--execution', 'cloud', '--dbt-shadow-all'])
+        self.assertEqual(run.call_args.kwargs['formula_migrations'],
+                         {f: 'shadow' for f in workflow.MIGRATED_FORMULAS | workflow.MIGRATED_IDENTITIES})
+
+
 class ShadowJobVerificationTests(unittest.TestCase):
     def test_valid_job_and_tampered_parameter(self):
         import hashlib
