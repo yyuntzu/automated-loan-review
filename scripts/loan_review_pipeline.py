@@ -200,6 +200,50 @@ def calculate_report(report, identity_reviews=(), *, cf01_backend=None, formula_
                 report = calculate_identity(report, **review, calculation_executor=executor)
         else:
             report = calculate_identity(report, **review)
+    # Explicit user-authorized automatic identities: the policy is recorded as
+    # such and is not represented as a company-specific definition review.
+    automatic = {fid: choice['backend'] for fid, choice in identity_backends.items()
+                 if isinstance(choice, dict) and choice.get('mode') == 'auto'}
+    identities = {
+        'DER-01': ('gross_profit', ('revenue', 'cost_of_revenue')),
+        'DER-02': ('cost_of_revenue', ('revenue', 'gross_profit')),
+        'DER-03': ('operating_expense', ('gross_profit', 'operating_income')),
+        'DER-04': ('operating_income', ('gross_profit', 'operating_expense')),
+        'DER-05': ('pretax_profit', ('net_income', 'income_tax')),
+        'DER-06': ('net_income', ('pretax_profit', 'income_tax')),
+    }
+    def depends(fid, metric, seen=None):
+        seen = set() if seen is None else seen
+        if fid in seen: return False
+        seen.add(fid)
+        fact = report.facts[fid]
+        return fact.metric == metric or any(depends(i, metric, seen) for i in fact.input_ids)
+    for _ in range(len(identities)):
+        changed = False
+        for formula, (metric, components) in identities.items():
+            if formula not in automatic: continue
+            for period in report.periods:
+                fid = metric + ':' + period.role
+                target = report.facts.get(fid)
+                if target is None or target.status in AVAILABLE or target.status in (Status.CONFLICT, Status.NOT_APPLICABLE): continue
+                ids = tuple((name + ':' + period.role) if name + ':' + period.role in report.facts
+                            else ('input:' + name + ':' + period.role) for name in components)
+                inputs = [report.facts.get(i) for i in ids]
+                if any(i is None or i.status not in AVAILABLE for i in inputs): continue
+                if any((i.period_role, i.start, i.end, i.unit, i.currency) !=
+                       (target.period_role, target.start, target.end, target.unit, target.currency) for i in inputs): continue
+                if any(depends(i.id, target.metric) for i in inputs): continue
+                eid = 'policy:auto-identity:' + formula + ':' + period.role
+                evidence = Evidence(eid, report.entity, report.scope, 'user-automatic-identity-policy',
+                    'auto-der-v1', date.today(), 'references/loan-review-integration.md', 'definition',
+                    (period.role,), 'User authorized automatic identity; company-specific definition has not been reviewed.')
+                report = replace(report, evidence={**report.evidence, eid: evidence})
+                executor = lambda r, t, items, f: _calculate_identity_external(r, t, items, f, automatic[f])
+                report = calculate_identity(report, fid, formula_id=formula, input_ids=ids,
+                    formula_version=formula.lower().replace('-', '') + '-dbt-exact-v1',
+                    definition_evidence_id=eid, calculation_executor=executor)
+                if report.facts[fid].status in AVAILABLE: changed = True
+        if not changed: break
     # The displayed basis is the approved formula, not an invented company EBITDA.
     for period in report.periods:
         role = period.role

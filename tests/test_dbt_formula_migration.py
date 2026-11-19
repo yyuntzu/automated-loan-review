@@ -42,7 +42,7 @@ class ShadowCliTests(unittest.TestCase):
         self.assertTrue(kwargs['cf01_migration'])
         self.assertEqual(kwargs['formula_migrations']['CF-03'], 'dbt')
         self.assertEqual(kwargs['formula_migrations']['CF-02'], 'unavailable')
-        self.assertEqual(kwargs['formula_migrations']['DER-05'], 'unavailable')
+        self.assertEqual(kwargs['formula_migrations']['DER-05'], 'auto')
         self.assertEqual(kwargs['promotion_receipts'], {'CF-03': '/tmp/shadow.json'})
 
     def test_unverified_formula_does_not_call_python_or_cloud(self):
@@ -340,6 +340,22 @@ class FormulaMigrationTests(unittest.TestCase):
         self.assertEqual(fact.value, Decimal('0.1000'))
         self.assertEqual(fact.input_ids, ('operating_margin:fy_t', 'operating_margin:fy_t_minus_1'))
 
+    def test_der05_automatic_dbt_without_definition_review(self):
+        report = fixture()
+        report = source_fact(report, 'net_income:fy_t', Decimal('80'))
+        report = source_fact(report, 'income_tax:fy_t', Decimal('-20'))
+        backend = KnownWarehouse({'pretax_profit:fy_t': '60'})
+        result = calculate_report(report, identity_backends={'DER-05': {'mode': 'auto', 'backend': backend}})
+        fact = result.facts['pretax_profit:fy_t']
+        self.assertEqual(fact.value, Decimal('60'))
+        self.assertEqual(fact.formula_version, 'der05-dbt-exact-v1')
+        self.assertIn('has not been reviewed', result.evidence[fact.evidence_ids[0]].content)
+        self.assertIn(fact.id, validate_arithmetic(result))
+        self.assertIn('尚未審核', render_loan_review(result, {'final_report_accepted':False, 'reconciliations':[]}))
+        metadata = next(x for x in calculation_metadata(result, 'run') if x['fact_id'] == fact.id)
+        self.assertEqual(metadata['definition_review_status'], 'not_reviewed_automatic')
+        self.assertEqual(metadata['definition_evidence_ids'], [])
+
     def test_der05_requires_reviewed_identity_then_uses_warehouse(self):
         report = fixture()
         report = source_fact(report, 'net_income:fy_t', Decimal('80'))
@@ -410,6 +426,12 @@ class FormulaMigrationTests(unittest.TestCase):
                 self.assertEqual(fact.value, Decimal(expected))
                 self.assertEqual(fact.input_ids, review['input_ids'])
                 self.assertIn('bridge', fact.evidence_ids)
+                automatic = calculate_report(report, identity_backends={
+                    formula: {'mode': 'auto', 'backend': KnownWarehouse({review['fact_id']: expected})}})
+                auto_fact = automatic.facts[review['fact_id']]
+                self.assertEqual(auto_fact.value, Decimal(expected))
+                self.assertEqual(auto_fact.input_ids, review['input_ids'])
+                self.assertIn('has not been reviewed', automatic.evidence[auto_fact.evidence_ids[0]].content)
 
     def test_der_selection_without_review_lists_candidates_without_deriving(self):
         class Cloud:
@@ -433,6 +455,30 @@ class FormulaMigrationTests(unittest.TestCase):
             inventory = json.loads(Path(tmp, 'identity_candidates.json').read_text())
             row = next(r for r in inventory['candidates'] if r['formula_id']=='DER-05' and r['period_role']=='fy_t')
             self.assertEqual(row['status'], 'review_required')
+
+    def test_automatic_der_workflow_writes_dbt_result_without_review_bundle(self):
+        class Cloud:
+            def ensure(self): pass
+            def stage_bundle(self, run_id, entity, bundle): return bundle
+            def record_run(self, run_id, entity, manifest): pass
+            def publish(self, *args): raise AssertionError('draft cannot publish')
+            def calculate_formula(self, request):
+                return dict(status='calculated', fact_id=request['fact_id'], formula_id=request['formula_id'],
+                    input_values=request['input_values'], raw_value='60', value='60', job_id='test', sql_sha256='a'*64)
+        financial = extract({
+            'NetIncomeLoss': {'units': {'USD': [entry(80000000)]}},
+            'IncomeTaxExpenseBenefit': {'units': {'USD': [entry(-20000000)]}},
+        })
+        snapshot = dict(schema_version=1, entity='SYNTHETIC-ONLY', cik='0000000001', financial_facts=financial)
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = run_review('SYNTHETIC-ONLY', request_fixture(), source='snapshot', snapshot=snapshot,
+                execution='cloud', cloud=Cloud(), output_dir=tmp, excel=False, commentary_mode='off',
+                formula_migrations={'DER-05':'auto'}, cf01_migration=False)
+            self.assertEqual(manifest['status'], 'draft', manifest.get('errors'))
+            fact = json.loads(Path(tmp, 'report.json').read_text())['facts']['pretax_profit:fy_t']
+            self.assertEqual(fact['value'], '60')
+            self.assertEqual(fact['formula_version'], 'der05-dbt-exact-v1')
+            self.assertIn('尚未審核', Path(tmp, 'report.md').read_text())
 
     def test_explicit_reviewed_der_shadow_keeps_direct_workflow_authority(self):
         class Cloud:

@@ -12,7 +12,7 @@ from scripts.review_outputs import calculation_metadata
 from scripts.review_workflow import export_excel
 from scripts.loan_review_contract import Status
 from test_dbt_formula_migration import ratio_fixture, source_input, missing_target
-from test_loan_review_contract import complete_fixture, source_fact
+from test_loan_review_contract import complete_fixture, fixture, source_fact
 
 
 @unittest.skipUnless(os.environ.get('FORMULA_LIVE_TEST') == '1', 'Opt in to synthetic BigQuery SELECT jobs')
@@ -36,6 +36,28 @@ class LiveFormulaTests(unittest.TestCase):
                     trace=dict(formula_id=formula, input_values=inputs, sql_sha256=result['sql_sha256'])))
         with self.assertRaisesRegex(ValueError, 'lossy'):
             cloud.calculate_formula(dict(fact_id='lossy', formula_id='CF-02', input_values=['1E-39', '1']))
+
+    def test_six_automatic_der_formulas_reach_report(self):
+        cloud = ReviewCloud()
+        cases = [
+            ('DER-01', 'gross_profit', ('revenue', 'cost_of_revenue'), ('500', '320'), '180'),
+            ('DER-02', 'cost_of_revenue', ('revenue', 'gross_profit'), ('500', '180'), '320'),
+            ('DER-03', 'operating_expense', ('gross_profit', 'operating_income'), ('180', '120'), '60'),
+            ('DER-04', 'operating_income', ('gross_profit', 'operating_expense'), ('180', '60'), '120'),
+            ('DER-05', 'pretax_profit', ('net_income', 'income_tax'), ('80', '-20'), '60'),
+            ('DER-06', 'net_income', ('pretax_profit', 'income_tax'), ('60', '-20'), '80'),
+        ]
+        for formula, target, inputs, values, expected in cases:
+            with self.subTest(formula=formula):
+                report = fixture()
+                for metric, value in zip(inputs, values):
+                    report = source_fact(report, metric + ':fy_t', Decimal(value))
+                report = calculate_report(report, identity_backends={formula: {'mode':'auto', 'backend':cloud}})
+                fact = report.facts[target + ':fy_t']
+                self.assertEqual(fact.value, Decimal(expected))
+                self.assertEqual(fact.formula_version, formula.lower().replace('-', '') + '-dbt-exact-v1')
+                metadata = next(m for m in calculation_metadata(report, 'a'*32) if m['fact_id'] == fact.id)
+                self.assertEqual(metadata['definition_review_status'], 'not_reviewed_automatic')
 
     def test_five_formulas_flow_through_formal_report_and_excel(self):
         cloud = ReviewCloud()

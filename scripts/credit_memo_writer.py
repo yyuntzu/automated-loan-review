@@ -834,6 +834,8 @@ def render_loan_review(report, acceptance) -> str:
                      for i in fact.input_ids]
             locators = list(dict.fromkeys(locator for i in fact.input_ids for locator in source_locators(i)))
             locators += [report.evidence[eid].locator for eid in fact.evidence_ids if report.evidence[eid].kind == 'definition']
+            if any(eid.startswith('policy:auto-identity:') for eid in fact.evidence_ids):
+                lines += ['> 注意：此 DER 為自動推導，尚未審核該公司財報定義及範圍。', '']
             lines += [f'> {esc(METRICS[fact.metric].label)}（{esc(periods[fact.period_role].label)}）：'
                       f'{esc(descriptions[fact.formula_id][1])}；輸入：{esc("；".join(parts))}；'
                       f'結果：{esc(fact.value)}（{esc(fact.unit)}）；公式：{esc(fact.formula_id)}，版本：{esc(fact.formula_version)}。',

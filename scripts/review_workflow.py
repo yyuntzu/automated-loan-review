@@ -158,7 +158,7 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
     if not isinstance(cf01_migration, bool): raise ValueError('cf01_migration must be boolean')
     if formula_migrations is None: formula_migrations = {}
     if (not isinstance(formula_migrations, dict) or set(formula_migrations) - (MIGRATED_FORMULAS | MIGRATED_IDENTITIES)
-            or any(mode not in ('shadow', 'dbt', 'unavailable') for mode in formula_migrations.values())):
+            or any(mode not in ('shadow', 'dbt', 'unavailable', 'auto') for mode in formula_migrations.values())):
         raise ValueError('formula_migrations requires supported formula IDs with shadow, dbt or unavailable modes')
     if execution == 'local' and 'shadow' in formula_migrations.values():
         raise ValueError('dbt shadow requires cloud execution; local mode does not invoke BigQuery')
@@ -269,7 +269,7 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
             for formula, mode in formula_migrations.items() if formula in MIGRATED_FORMULAS}
         identity_modes = {formula: mode for formula, mode in formula_migrations.items() if formula in MIGRATED_IDENTITIES}
         identity_backends = {formula: ({'mode':'shadow', 'backend':cloud, 'observations':shadows}
-            if mode == 'shadow' else ('offline' if mode == 'unavailable' else (cloud if execution == 'cloud' else 'offline')))
+            if mode == 'shadow' else ({'mode':'auto', 'backend':cloud if execution == 'cloud' else 'offline'} if mode == 'auto' else ('offline' if mode == 'unavailable' else (cloud if execution == 'cloud' else 'offline'))))
             for formula, mode in identity_modes.items()}
         if 'base_report' in bundle:
             report, acceptance = complete_report(restore_report(json.loads(json.dumps(bundle['base_report'], default=str))),
@@ -287,7 +287,7 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
             manifest['stages']['formula_shadow'] = ('not_evaluated' if not shadows else
                 'mismatch' if any(r['comparison']=='mismatch' for r in shadows) else
                 'incomplete' if any(r['comparison']=='unavailable' for r in shadows) else 'passed')
-        selected_identities = set(formula_migrations) & MIGRATED_IDENTITIES
+        selected_identities = {f for f, mode in formula_migrations.items() if f in MIGRATED_IDENTITIES and mode != 'auto'}
         if selected_identities:
             write_json(directory / 'identity_candidates.json', dict(run_id=run_id, entity=entity,
                 candidates=identity_candidates(report, selected_identities)))
@@ -361,7 +361,7 @@ def run_review(ticker, request=None, *, source='sec', snapshot=None, supplements
             write_json(directory/'commentary_validation.json',dict(complete=False,error=str(exc),mode=commentary_mode,version='formal-commentary-balance-sheet-v3'))
             manifest['outputs']['commentary_validation_path']=str(directory/'commentary_validation.json')
         outputs = write_report_artifacts(report, acceptance, directory, source_bundle=bundle)
-        requested_metadata = {formula for formula, mode in formula_migrations.items() if mode in ('dbt', 'unavailable')}
+        requested_metadata = {formula for formula, mode in formula_migrations.items() if mode in ('dbt', 'unavailable', 'auto')}
         if cf01_migration: requested_metadata.add('CF-01')
         if requested_metadata:
             write_json(directory / 'formula_metadata.json', dict(run_id=run_id, entity=entity,
@@ -473,7 +473,7 @@ def cli(argv):
             if args.execution == 'local' and receipts: raise ValueError('Local migration does not use shadow receipts')
             supported = MIGRATED_FORMULAS | MIGRATED_IDENTITIES
             if set(dict(receipts)) - supported: raise ValueError('Unsupported shadow receipt formula')
-            pairs = [[f, 'dbt' if args.execution == 'local' or f in dict(receipts) else 'unavailable'] for f in sorted(supported)]
+            pairs = [[f, 'auto' if f in MIGRATED_IDENTITIES else ('dbt' if args.execution == 'local' or f in dict(receipts) else 'unavailable')] for f in sorted(supported)]
             if args.cf01_dbt is False: raise ValueError('--dbt-migrate-all cannot use --cf01-python')
             args.cf01_dbt = True
         result = run_review(args.ticker, load_json(args.request) if args.request else None,

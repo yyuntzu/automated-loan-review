@@ -300,8 +300,9 @@ HTTP uses `formula_migrations` and `promotion_receipts` objects; each receipt
 contains `manifest` and the exact `shadow_json` text, not a server file path.
 
 Selected migrated calculations are unavailable locally; no Python fallback is
-used. DER calculations additionally require an explicit `--identity-reviews`
-JSON bundle with reviewer, source definition, period and input evidence bindings.
+used. In the per-formula reviewed DER mode, calculations require an explicit
+`--identity-reviews` JSON bundle. The separate `--dbt-migrate-all` mode uses
+automatic DER calculation without company-specific review, as described below.
 `identity_candidates.json` is an inventory for human review, not an approval.
 The report and `formula_metadata.json` show formula, inputs, period, source,
 result, status and version; approved cloud publication also exposes metadata
@@ -348,13 +349,11 @@ venv/bin/python scripts/agent_runner.py SYNTHETIC-ONLY \
 ### Use the migration-only mode
 
 `--dbt-migrate-all` selects CF-01/02/03/04/09/16 and DER-01..06 for the
-migration. In cloud mode, CF-01 uses dbt. For each other formula, supply
+migration. In cloud mode, CF-01 uses dbt. For each CF-02/03/04/09/16 formula, supply
 `--shadow-receipt ID=/path/to/shadow/run_manifest.json` to request adoption of
 its dbt result. The existing workflow independently verifies each receipt and
-BigQuery job before adopting results. Selected formulas without a receipt are
-explicitly unavailable and are never silently calculated by Python. DER still
-requires `--identity-reviews` with a separately reviewed definition for the
-company and period. Direct source facts retain priority.
+BigQuery job before adopting results. Selected CF formulas without a receipt are
+explicitly unavailable and are never silently calculated by Python. DER uses automatic dbt identity calculation without a company-specific review. Direct source facts retain priority.
 
 Example after reviewing the shadow comparisons:
 
@@ -369,7 +368,20 @@ venv/bin/python scripts/agent_runner.py PLTR \
 
 Repeat the receipt option for each formula with a successful prior shadow;
 the same manifest can be used for multiple formulas if each has matching
-observations. For DER include its approved identity-review bundle. Local mode
+observations. Local mode
 can run this option for inspection but all migrated calculations are marked
 unavailable, as it cannot run dbt/BigQuery. A draft exit code of 2 signals that
 acceptance remains incomplete and is not equivalent to successful publication.
+
+
+### Automatic DER migration mode
+
+Under `--dbt-migrate-all`, DER-01..06 are automatically calculated by the
+BigQuery/dbt identity model when their ordered inputs are available and match
+the target entity, scope, period, unit and currency. Direct source facts retain
+priority; conflicting targets and circular/reverse identities are not replaced.
+This mode follows the user's decision to dispense with company-specific review
+and prior DER shadow receipts. Reports identify the calculation as automatic
+and not company-definition reviewed. Missing or incompatible inputs remain
+unavailable. Local mode does not perform a Python substitute. Phase 3 CF
+formulas retain their independent successful-shadow prerequisites.
